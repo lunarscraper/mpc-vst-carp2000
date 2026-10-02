@@ -4,7 +4,7 @@ Repo: `mpc-vst-carp2000`
 
 Semi-modularer Synthesizer nach dem Vorbild des ARP 2600 als VST2-Plugin für Akai Force und MPC (Standalone), gebaut auf dem mpc-vst-plugins-Gerüst (DPF).
 
-**Status:** Phase 1 (monophone Grundstimme) und Phase 2 (Modulation) umgesetzt, siehe [Stand](#stand). Phase 3 ist Konzept.
+**Status:** Alle drei Phasen des Fahrplans sind umgesetzt, siehe [Stand](#stand).
 
 ## Idee
 
@@ -207,13 +207,13 @@ Sechs Slots, je **Quelle**, **Ziel**, **Stärke** (−100 … +100 %). Die negat
 
 Code in `vst/`: `carp_core.h` (die Stimme), `carp_vst.cpp` (Plugin, MIDI, Projekt-Chunk), `host_test.cpp` (Offline-Test und Benchmark). Bauen über GitHub Actions („VST release (draft)") oder lokal mit `vst/build.sh`, danach `vst/test.sh`.
 
-Umgesetzt sind die Seiten 1 bis 8 und die Matrix. Es fehlen nur die Regler aus Phase 3: Hall-Anteil, Hall-Länge und Stimmenmodus.
+Umgesetzt sind die Seiten 1 bis 8, die Matrix, der Federhall, die drei Stimmenmodi und 13 Presets (eigener Tab PRESET).
 
 Festlegungen, die das Konzept offen ließ:
 
 - **Coarse** rastet in Halbtönen. Mit Keyboard zeigt der Regler die Transposition zur gespielten Taste (`+12 st`), ohne Keyboard oder im LF-Modus die Frequenz.
 - **LF-Modus** trennt wie beim Original die Tastatur ab. VCO 2 hat keinen eigenen Keyboard-Schalter und folgt im Audio-Modus immer der Tastatur.
-- **Tastatur:** eine Stimme, die zuletzt gedrückte Taste klingt. Trigger „single" löst bei gebundenem Spiel nicht neu aus, „multiple" bei jeder Taste. Pitchbend ± 2 Halbtöne.
+- **Tastatur (mono):** eine Stimme, die zuletzt gedrückte Taste klingt. Trigger „single" löst bei gebundenem Spiel nicht neu aus, „multiple" bei jeder Taste. Pitchbend ± 2 Halbtöne.
 - **Filtertyp:** 4012 reicht bis 18 kHz, 4072 endet wie das Original bei etwa 11 kHz. Weitere Unterschiede der beiden Schaltungen sind nicht modelliert.
 - **Dreieck von VCO 2** ist nicht bandbegrenzt (Obertöne fallen mit 1/n², Aliasing bleibt gering).
 - **Repeat** hat drei Stellungen: OFF, KEY (das LFO-Rechteck ist das Gate, solange eine Taste gehalten wird) und AUTO (auch ohne Taste). Der Takt kommt wie im Konzept vom LFO, nicht von der S&H-Clock.
@@ -222,10 +222,13 @@ Festlegungen, die das Konzept offen ließ:
 - **Ringmodulator** ohne AC/DC-Schalter: Auf den acht Seiten ist kein Platz dafür, und bei Sägezahn × Sinus ist der Unterschied klein.
 - **Matrix-Quellen:** VCO 1 liefert den Sägezahn, VCO 2 den Sinus, VCO 3 den Puls (dafür ist dessen Pulsbreite da). Diese drei und das Rauschen modulieren in Audiorate, alle anderen im Kontrolltakt. LFO-Rate und S&H-Rate nehmen auch Audioquellen nur im Kontrolltakt an.
 - **Matrix-Stärke** quadratisch (feinfühlig um 0). ± 100 % entsprechen ± 4 Oktaven Tonhöhe, ± 5 Oktaven Cutoff, ± 40 % Pulsbreite, der vollen Resonanz, dem vollen VCA-Pegel, voll links/rechts und ± 4 Oktaven Rate.
-- **Matrix-Ziel REVERB** ist schon wählbar, wirkt aber erst mit Phase 3.
+- **Duophon:** wie bei der 3620-Tastatur. Die tiefste gehaltene Taste spielt VCO 1, VCO 3 und das Filter-Tracking, die höchste VCO 2. Filter, Hüllkurven und VCA gibt es weiter nur einmal.
+- **Poly 4:** vier vollständige Stimmen, jede mit eigenem LFO und S&H. Die fünfte Taste übernimmt die älteste Stimme. Jede Taste löst neu aus, der Trigger-Schalter wirkt nur mono und duophon. Der Summenpegel ist um 3 dB abgesenkt. Initial Gain und Repeat AUTO wirken nur auf die erste Stimme, sonst klängen ohne Taste vier Stimmen.
+- **Federhall:** einmal pro Plugin. Zwei Federn (links/rechts), jede eine Verzögerung mit gedämpfter Rückkopplung und einer Kette gestreckter Allpässe für das typische Zwitschern. Hall-Anteil ist der Send hinter dem VCA, das Direktsignal bleibt unverändert. Länge 0,4 – 4 s.
+- **Presets** sind ein Parameter: Auswählen überschreibt alle Regler. Projekte speichern die Regler selbst, ein nach dem Laden verändertes Preset bleibt also erhalten. VST-Programme nutzt das Plugin nicht.
 - Neue Parameter werden hinten angehängt. Projekte speichern nach Schlüssel und bleiben ladbar.
 
-CPU-Last im Offline-Benchmark auf einem x86-Kern: etwa 0,5 % für das Startpatch, 1 % im ungünstigsten Fall (alle Quellen, sechs Matrix-Slots in Audiorate).
+CPU-Last im Offline-Benchmark auf einem x86-Kern: etwa 0,5 % für das Startpatch, 0,8 % im ungünstigsten Mono-Fall (alle Quellen, sechs Matrix-Slots in Audiorate) und 3,2 % für denselben Fall mit vier Stimmen und Hall.
 
 ## Nicht enthalten
 

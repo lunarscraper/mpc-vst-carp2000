@@ -79,6 +79,10 @@
     {"key": "m5_amt", "name": "Mod 5 Amount", "min": -100, "max": 100},
     {"key": "m6_src", "name": "Mod 6 Source", "options": ["OFF", "VCO1 SAW", "VCO2 SINE", "VCO3 PULSE", "NOISE", "S&H", "ADSR", "AR", "LFO", "KEYBOARD", "VELOCITY", "AFTERTOUCH", "MOD WHEEL"]},
     {"key": "m6_dst", "name": "Mod 6 Dest", "options": ["VCO1 PITCH", "VCO2 PITCH", "VCO3 PITCH", "VCO2 PW", "VCO3 PW", "CUTOFF", "RESONANCE", "VCA", "PAN", "REVERB", "LFO RATE", "S&H RATE"]},
-    {"key": "m6_amt", "name": "Mod 6 Amount", "min": -100, "max": 100}
+    {"key": "m6_amt", "name": "Mod 6 Amount", "min": -100, "max": 100},
+    {"key": "rev_mix", "name": "Reverb", "min": 0, "max": 100},
+    {"key": "rev_len", "name": "Reverb Length", "min": 0, "max": 100},
+    {"key": "voice_mode", "name": "Voice Mode", "options": ["MONO", "DUO", "POLY 4"]},
+    {"key": "preset", "name": "Preset", "options": ["INIT", "BASS", "LEAD", "KICK", "SNARE", "S&H BUBBLES", "RING BELL", "CROSS MOD", "WIND", "AUTO PULSE", "POLY PAD", "DUO LEAD", "LASER"]}
   ]
 }

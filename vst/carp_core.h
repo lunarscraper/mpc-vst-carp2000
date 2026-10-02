@@ -1,8 +1,9 @@
 /* =============================================================================
- * carp_core.h - carp 2000, phases 1 + 2: the monophonic voice of a semi-modular synthesizer
- * in the manner of the ARP 2600. One Voice = 3 VCOs, ring modulator, noise -> filter mixer ->
+ * carp_core.h - carp 2000: the voice of a semi-modular synthesizer in the manner of the
+ * ARP 2600, and its spring reverb. One Voice = 3 VCOs, ring modulator, noise -> filter mixer ->
  * 4-pole ladder -> VCA, with ADSR, AR, LFO, sample & hold and a 6-slot modulation matrix in
- * place of the patch cords. The plug-in around it is carp_vst.cpp. MIT license.
+ * place of the patch cords. The plug-in around it (carp_vst.cpp) runs one voice (mono, or
+ * duophonic: VCO 2 follows the upper key) or four (poly) into one Reverb. MIT license.
  *
  *   VCO 1 (saw, square)  <- FM: S&H, ADSR, VCO 2 sine
  *   VCO 2 (sine, triangle, pulse)  <- FM: S&H, ADSR, VCO 1 square; PWM: noise
@@ -18,12 +19,13 @@
  * Performance rules (README): float only, no libm in the audio loop, slow modulation every
  * CTL samples with linear ramps in between, audio-rate maths only where a VCO or noise is the
  * source, silent mixer channels and an idle voice are skipped, 2x oversampling in the filter only.
- * Voice holds no global state, so phase 3 can run four of them.
+ * Voice holds no global state; render() adds into the output and the reverb send.
  * ========================================================================== */
 #pragma once
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace carp {
 
@@ -107,6 +109,7 @@ struct Patch {
     int repeat = REPEAT_OFF;        /* KEY: the LFO square gates the envelopes while a key is held; AUTO: always */
     float gain = 0, vca_ar = 0, vca_adsr = 1, vca_ring = 0;
     float pan = 0;                  /* -1..1 */
+    float rev = 0;                  /* send into the spring, 0..1 */
     float volume = 0.6f;
     float lfo_rate = 5;             /* Hz */
     int lfo_shape = LFO_SINE;
@@ -123,6 +126,7 @@ struct Voice {
         ph[0] = 0; ph[1] = 0.37f; ph[2] = 0.71f;
         s1 = s2 = s3 = s4 = 0; xprev = 0; hp = 0;
         sq1 = saw1 = sin2 = pul3 = noise = 0; nb0 = nb1 = nb2 = nred = 0;
+        note2 = pitch2 = 60; pitch_set = false; rsend = 0; vol = 0;
         adsr = ar = 0; key = false; egate = false; att_stage = false;
         lfo_ph = 0; lfo = 0; sh_ph = 1; sh_raw = sh = 0; vib_t = 0;
         left = 0; snap = true; vgain = 0;
@@ -157,24 +161,25 @@ struct Voice {
         }
     }
     void note_on(int n, float velocity, bool retrigger) {
-        note = (float)n;
-        if (!pitch_set) { pitch = note; pitch_set = true; }
+        note = note2 = (float)n;
+        if (!pitch_set) { pitch = pitch2 = note; pitch_set = true; }
         if (!key || retrigger) { vel = velocity; vib_t = 0; if (pt.repeat == REPEAT_OFF) att_stage = true; }
         key = true;
     }
+    void set_upper(int n) { note2 = (float)n; }      /* duophonic: the upper key, for VCO 2 (after note_on) */
     void note_off() { key = false; }
     void set_bend(float semitones) { bend = semitones; }
     void set_wheel(float v) { wheel = v; }
     void set_aftertouch(float v) { touch = v; }
     bool idle() const { return is_idle; }
 
-    void render(float *L, float *R, int n) {
+    /* adds n samples to L, R and to the reverb send S */
+    void render(float *L, float *R, float *S, int n) {
         int i = 0;
         while (i < n) {
             if (left == 0) { tick(); left = CTL; }
             const int m = left < n - i ? left : n - i;
-            if (is_idle) { for (int k = 0; k < m; k++) L[i + k] = R[i + k] = 0; }
-            else run(L + i, R + i, m);
+            if (!is_idle) run(L + i, R + i, S + i, m);
             left -= m; i += m;
         }
     }
@@ -191,7 +196,7 @@ private:
     float s1, s2, s3, s4, xprev, hp, hp_c = 0;
     float G = 0, dG = 0, fc = 100, dfc = 0, fmax = 18000;
     /* envelopes, keyboard, LFO, S&H */
-    float adsr, ar, vel = 1, note = 60, pitch = 60, bend = 0, wheel = 0, touch = 0;
+    float adsr, ar, vel = 1, note = 60, pitch = 60, note2 = 60, pitch2 = 60, bend = 0, wheel = 0, touch = 0;
     bool key, egate, att_stage, pitch_set = false, is_idle = true, snap;
     float lfo_ph, lfo, sh_ph, sh_raw, sh, vib_t;
     float c_att = 1, c_dec = 1, c_rel = 1, c_aatt = 1, c_arel = 1, c_glide = 1, c_lag = 1, c_smooth = 1;
@@ -202,7 +207,7 @@ private:
     float c_amt[NSLOTS], cm[NDST] = {0};
     /* smoothed controls */
     float lvl[NMIX] = {0, 0, 0, 0, 0, 0, 0}, cut = 7, k = 0, kbase = 0, pw = 0.5f, pw3 = 0.5f, drv = 0.5f, gl = 0, gr = 0, gain0 = 0;
-    float ring_direct = 0, color = 0;
+    float ring_direct = 0, color = 0, rsend = 0, vol = 0;
     float vgain, dvgain = 0;
     int left;
 
@@ -263,6 +268,7 @@ private:
             ar -= c_arel * ar; if (ar < 1e-4f) ar = 0;
         }
         pitch += (note - pitch) * c_glide;
+        pitch2 += (note2 - pitch2) * c_glide;
 
         /* vibrato, faded in after the delay */
         vib_t += dt;
@@ -280,14 +286,16 @@ private:
         gain0 += (p.gain - gain0) * cs;
         ring_direct += (p.vca_ring - ring_direct) * cs;
         color += (p.noise_color - color) * cs;
+        vol += (p.volume - vol) * cs;
+        rsend += (clampf(p.rev + cm[DST_REVERB], 0.0f, 1.0f) - rsend) * cs;
         const float a = (clampf(p.pan + cm[DST_PAN], -1.0f, 1.0f) + 1) * 0.125f;   /* 0..0.25 = 0..90 degrees, constant power */
         gl += (p.volume * fast_sin(0.25f + a) - gl) * cs;          /* cos */
         gr += (p.volume * fast_sin(a) - gr) * cs;
 
-        const float kv = pitch - 60 + bend + vib;
+        const float kv = pitch - 60 + bend + vib, kv2 = pitch2 - 60 + bend + vib;
         for (int v = 0; v < 3; v++) {
             const bool track = p.kbd[v] && !p.lf[v];
-            const float oct = (p.semis[v] + (track ? kv : 0.0f) - 69.0f) * (1.0f / 12.0f)
+            const float oct = (p.semis[v] + (track ? (v == 1 ? kv2 : kv) : 0.0f) - 69.0f) * (1.0f / 12.0f)
                             + p.fm_adsr[v] * adsr + p.fm_sh[v] * sh + cm[DST_P1 + v];
             float f = 440.0f * fast_exp2(oct);
             if (p.lf[v]) f *= 0.003f;
@@ -329,7 +337,7 @@ private:
     }
     inline float amod(int d) const { return a_c[d][0] * saw1 + a_c[d][1] * sin2 + a_c[d][2] * pul3 + a_c[d][3] * noise; }
 
-    void run(float *L, float *R, int m) {
+    void run(float *L, float *R, float *S, int m) {
         const Patch &p = pt;
         const float eps = 1e-4f;
         bool on[NMIX];
@@ -348,6 +356,8 @@ private:
         const float cw = color < 0.5f ? 1 - 2 * color : 0.0f, cr = color > 0.5f ? 2 * color - 1 : 0.0f, cp = 1 - cw - cr;
         const float makeup = 1.0f / clampf(drv, 0.35f, 1.0f);
         const float pi_fs2 = 3.14159265f / fs2;
+        const bool send = rsend > eps || p.rev > eps;
+        const float sg = rsend * vol;
         float p1 = ph[0], p2 = ph[1], p3 = ph[2];
 
         for (int i = 0; i < m; i++) {
@@ -416,13 +426,77 @@ private:
             if (ring_vca) y += ring_direct * rm;                   /* past the filter, into the VCA */
             hp += hp_c * (y - hp); y -= hp;                        /* DC (asymmetric pulse) before the VCA */
             y *= va;
-            L[i] = y * pl; R[i] = y * pr;
+            L[i] += y * pl; R[i] += y * pr;
+            if (send) S[i] += y * sg;
 
             inc[0] += dinc[0]; inc[1] += dinc[1]; inc[2] += dinc[2];
             G += dG; fc += dfc; vgain += dvgain;
         }
         ph[0] = p1; ph[1] = p2; ph[2] = p3;
     }
+};
+
+/* Spring reverb, once per plug-in: two springs, each a delay line in a damped feedback loop with
+ * a chain of stretched allpasses (z^-K), which delays the treble more than the bass on every
+ * pass - the spring's chirp. Mono in, spring A left, spring B right. No convolution. */
+struct Reverb {
+    void init(float rate) {
+        sr = rate;
+        K = (int)(rate / 11025.0f + 0.5f); if (K < 1) K = 1; if (K > KMAX) K = KMAX;
+        sp[0].init((int)(0.0331f * rate), 0.62f);
+        sp[1].init((int)(0.0413f * rate), 0.58f);
+        ki = 0; in1 = in2 = inhp = 0; awake = false; quiet = 0;
+        c_in = 1 - std::exp(-2 * 3.14159265f * 4500 / rate);
+        c_hp = 1 - std::exp(-2 * 3.14159265f * 120 / rate);
+        c_out = 1 - std::exp(-2 * 3.14159265f * 5000 / rate);
+        set_length(len);
+    }
+    void set_length(float seconds) {               /* decay time to -60 dB */
+        len = seconds;
+        for (int s = 0; s < 2; s++) sp[s].fb = std::pow(10.0f, -3.0f * (float)sp[s].n / (sr * seconds));
+    }
+    bool active() const { return awake; }
+    /* reads the send S, adds the wet signal to L and R */
+    void process(const float *S, float *L, float *R, int n) {
+        float pk = 0;
+        for (int i = 0; i < n; i++) { const float a = std::fabs(S[i]); if (a > pk) pk = a; }
+        if (!awake) { if (pk < 1e-6f) return; awake = true; quiet = 0; }
+        float opk = 0;
+        for (int i = 0; i < n; i++) {
+            in1 += c_in * (S[i] - in1); in2 += c_in * (in1 - in2);
+            inhp += c_hp * (in2 - inhp);
+            const float x = in2 - inhp;
+            const float a = sp[0].step(x, K, ki, c_out), b = sp[1].step(x, K, ki, c_out);
+            if (++ki >= K) ki = 0;
+            L[i] += 0.6f * (a + 0.25f * b); R[i] += 0.6f * (b + 0.25f * a);
+            const float m = std::fabs(a) + std::fabs(b); if (m > opk) opk = m;
+        }
+        if (pk < 1e-6f && opk < 1e-6f) { quiet += n; if (quiet > (int)sr) { awake = false; for (int s = 0; s < 2; s++) sp[s].clear(); in1 = in2 = inhp = 0; } }
+        else quiet = 0;
+        if (not_finite(opk)) { for (int s = 0; s < 2; s++) sp[s].clear(); in1 = in2 = inhp = 0; }
+    }
+private:
+    enum { NAP = 24, KMAX = 20 };
+    struct Spring {
+        std::vector<float> buf;
+        int n = 1, pos = 0;
+        float a = 0.6f, fb = 0.5f, damp = 0, out = 0, ap[NAP][KMAX];
+        void init(int length, float coef) { n = length < 8 ? 8 : length; a = coef; buf.assign((size_t)n, 0.0f); clear(); }
+        void clear() { std::fill(buf.begin(), buf.end(), 0.0f); pos = 0; damp = out = 0; std::memset(ap, 0, sizeof ap); }
+        inline float step(float in, int, int ki, float c_out) {
+            const float y = buf[(size_t)pos];
+            damp += 0.45f * (y - damp);                       /* loop damping */
+            float x = in + fb * damp;
+            for (int j = 0; j < NAP; j++) { const float o = a * x + ap[j][ki]; ap[j][ki] = x - a * o; x = o; }
+            buf[(size_t)pos] = x; if (++pos >= n) pos = 0;
+            out += c_out * (y - out);
+            return out;
+        }
+    };
+    Spring sp[2];
+    float sr = 44100, len = 2, in1 = 0, in2 = 0, inhp = 0, c_in = 0.5f, c_hp = 0.02f, c_out = 0.5f;
+    int K = 4, ki = 0, quiet = 0;
+    bool awake = false;
 };
 
 }   // namespace carp

@@ -2,7 +2,8 @@
  * tuning (VCO, coarse, pitch bend), the filter (darkening, keyboard-tracked self-oscillation,
  * 4072 ceiling), ADSR/AR/VCA (sustain, release, initial gain), mono key handling (last note,
  * single/multiple trigger), LF mode, cross FM, pan, ring modulator, noise colour, LFO vibrato
- * with delay, S&H, REPEAT, the modulation matrix at control and audio rate, output ceiling,
+ * with delay, S&H, REPEAT, the modulation matrix at control and audio rate, the spring reverb,
+ * duophonic and four-voice modes, every preset, output ceiling,
  * chunk restore, a random parameter/MIDI stress run, NaN/denormal-free output.
  * With "bench" as the second argument it only measures CPU load. Prints PASSED/FAILED. */
 #include <chrono>
@@ -41,6 +42,7 @@ static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; std::printf("FAIL: " __VA_ARGS__); std::printf("\n"); } } while (0)
 static const float SR = 44100;
 static const int BS = 256;
+static const int NPRESETS = 13;
 static bool bad = false;
 typedef std::vector<float> Buf;
 
@@ -62,7 +64,8 @@ static void set(AEffect *e, const char *name, double v) {
     else if (ends("Amount")) { lo = -100; hi = 100; }
     else if (ends("Source") && s != "S&H Source") { hi = 12; }
     else if (ends("Dest")) { hi = 11; }
-    else if (s == "LFO Shape" || s == "S&H Source" || s == "Repeat") { hi = 2; }
+    else if (s == "LFO Shape" || s == "S&H Source" || s == "Repeat" || s == "Voice Mode") { hi = 2; }
+    else if (s == "Preset") { hi = NPRESETS - 1; }
     else if (ends(" LF") || (ends("Keyboard") && s != "VCF Keyboard") || s == "VCF Type" || s == "Trigger") { hi = 1; }
     e->setParameter(e, param(e, name), (float)((v - lo) / (hi - lo)));
 }
@@ -117,7 +120,8 @@ static void plain(AEffect *e) {
                           "VCO2 FM VCO1", "VCO2 PWM Noise", "VCO3 FM Noise", "VCO3 FM ADSR", "VCO3 FM VCO2", "Portamento",
                           "ADSR Attack", "ADSR Release", "AR Attack", "AR Release", "VCA Initial Gain", "VCA AR", "VCF Drive",
                           "VCO1 FM S&H", "VCO2 FM S&H", "Mix Ring Mod", "Noise Color", "VCA Ring Mod", "Vibrato Depth", "Vibrato Delay", "S&H Lag",
-                          "Repeat", "LFO Shape", "S&H Source"}) set(e, k, 0);
+                          "Repeat", "LFO Shape", "S&H Source", "Reverb", "Voice Mode"}) set(e, k, 0);
+    set(e, "Reverb Length", 50);
     for (int i = 1; i <= 6; i++) { char b[32]; std::snprintf(b, sizeof b, "Mod %d Source", i); set(e, b, 0); std::snprintf(b, sizeof b, "Mod %d Amount", i); set(e, b, 0); }
     set(e, "LFO Rate", 67); set(e, "S&H Rate", 63); set(e, "VCO3 Pulse Width", 50);
     for (const char *k : {"VCO1 LF", "VCO2 LF", "VCO3 LF", "VCF Type", "Trigger"}) set(e, k, 0);
@@ -139,8 +143,9 @@ int main(int argc, char **argv) {
     e->dispatcher(e, 0, 0, 0, nullptr, 0);
     e->dispatcher(e, 10, 0, 0, nullptr, SR);
     if (argc > 2 && !std::strcmp(argv[2], "bench")) {
-        struct { const char *what; int mode; } B[] = {{"idle (no key)", 0}, {"start patch, key held", 1}, {"worst case: all sources, all FM, 6 audio-rate slots", 2}};
+        struct { const char *what; int mode; } B[] = {{"idle (no key)", 0}, {"start patch, key held", 1}, {"worst case: all sources, all FM, 6 audio-rate slots", 2}, {"the same, four voices + reverb", 3}};
         for (auto &b : B) {
+            if (b.mode == 3) { set(e, "Voice Mode", 2); set(e, "Reverb", 60); run(e, 0.1); on(e, 52); on(e, 57); on(e, 60); }
             if (b.mode >= 1) on(e, 45);
             if (b.mode == 2) {
                 for (const char *k : {"Mix VCO1 Square", "Mix VCO2 Pulse", "Mix VCO3 Saw", "Mix Noise", "Mix VCO1 Saw", "Mix VCO2 Triangle"}) set(e, k, 70);
@@ -401,6 +406,85 @@ int main(int argc, char **argv) {
         std::printf("  matrix: VCO 3 -> cutoff: sideband at 1099 Hz %.1f dBFS (without %.1f dBFS)\n", db(sbm), db(sbn));
         CHECK(sbm > 5 * sbn && sbm > 1e-3, "audio-rate filter FM wrong");
         off(e, 69);
+    }
+
+    /* P3.1 spring reverb: a tail after the note, longer with LENGTH, stereo, silent again; matrix -> reverb */
+    plain(e);
+    {
+        double tail[3], late[2];
+        for (int k = 0; k < 3; k++) {
+            set(e, "Reverb", k ? 70 : 0); set(e, "Reverb Length", k == 2 ? 100 : 0);
+            on(e, 57); run(e, 0.3); off(e, 57); Buf R; auto L = run(e, 3.0, &R);
+            tail[k] = rms(L, 0.1, 0.3); if (k) late[k - 1] = rms(L, 1.5, 2.5);
+            if (k == 2) { double d = 0; for (size_t i = 4410; i < 13230; i++) d += std::fabs(L[i] - R[i]); CHECK(d / 8820 > 0.3 * tail[2], "reverb is mono"); }
+            run(e, 8.0);
+        }
+        double z = rms(run(e, 1.0), 0);
+        std::printf("  reverb: tail %.6f dry, %.1f dBFS short (%s), %.1f dBFS long; 2 s later %.1f / %.1f dBFS; after 11 s %.6f\n",
+                    tail[0], db(tail[1]), "0.4 s", db(tail[2]), db(late[0]), db(late[1]), z);
+        CHECK(tail[0] < 1e-5 && tail[1] > 1e-3 && tail[2] > 1e-3 && late[1] > 10 * late[0] && late[1] > 1e-4 && z == 0, "reverb wrong");
+        set(e, "Reverb", 0); set(e, "Mod 1 Source", 12); set(e, "Mod 1 Dest", 9); set(e, "Mod 1 Amount", 100); send(e, 0xb0, 1, 127);
+        on(e, 57); run(e, 0.3); off(e, 57); double mt = rms(run(e, 1.0), 0.1, 0.3); send(e, 0xb0, 1, 0); run(e, 10.0);
+        std::printf("  matrix: mod wheel -> reverb: tail %.1f dBFS\n", db(mt));
+        CHECK(mt > 1e-3, "matrix -> reverb wrong");
+    }
+
+    /* P3.2 duophonic: VCO 1 on the lower key, VCO 2 on the upper; mono plays both on the newest key */
+    plain(e);
+    {
+        set(e, "Mix VCO2 Triangle", 100);
+        double lo[2], hi[2];
+        for (int k = 0; k < 2; k++) {
+            set(e, "Voice Mode", k); run(e, 0.1);
+            on(e, 57); on(e, 64); auto a = run(e, 0.8);
+            lo[k] = goertzel(a, 220); hi[k] = goertzel(a, 329.63);
+            if (k) { off(e, 64); auto b = run(e, 0.8); CHECK(goertzel(b, 329.63, 0.3) < 0.05 * hi[1] && goertzel(b, 440, 0.3) > 0.02, "duophonic: upper key released, VCO 2 does not come down"); }
+            off(e, 64); off(e, 57); run(e, 0.3);
+        }
+        std::printf("  mono, keys A3+E4: 220 Hz %.4f, 330 Hz %.4f; duophonic: 220 Hz %.4f, 330 Hz %.4f\n", lo[0], hi[0], lo[1], hi[1]);
+        CHECK(lo[0] < 0.01 * hi[0] && lo[1] > 0.05 && hi[1] > 0.05, "duophonic mode wrong");
+    }
+
+    /* P3.3 poly: four voices, the fifth key takes the oldest */
+    plain(e);
+    {
+        set(e, "Voice Mode", 2); run(e, 0.1);
+        on(e, 57); run(e, 0.05); on(e, 61); run(e, 0.05); on(e, 64); auto a = run(e, 0.8);
+        double c3[3] = {goertzel(a, 220, 0.3), goertzel(a, 277.18, 0.3), goertzel(a, 329.63, 0.3)};
+        on(e, 68); run(e, 0.05); on(e, 71); auto b = run(e, 0.8);
+        double first = goertzel(b, 220, 0.3), fifth = goertzel(b, 493.88, 0.3), pk = peak(b);
+        for (int n : {57, 61, 64, 68, 71}) off(e, n);
+        double z = rms(run(e, 0.5), 0.3);
+        std::printf("  poly: chord %.4f / %.4f / %.4f; five keys: first %.5f, fifth %.4f, peak %.3f; released %.6f\n", c3[0], c3[1], c3[2], first, fifth, pk, z);
+        CHECK(c3[0] > 0.03 && c3[1] > 0.03 && c3[2] > 0.03 && first < 0.1 * c3[0] && fifth > 0.03 && z < 1e-4, "poly mode wrong");
+        set(e, "Voice Mode", 0); run(e, 0.1);
+    }
+
+    /* P3.4 presets: each one sounds and stays in range; INIT restores the start patch; a chunk keeps edits */
+    {
+        AEffect *fresh = mainf(master);
+        fresh->dispatcher(fresh, 10, 0, 0, nullptr, SR);
+        for (int k = 1; k < NPRESETS; k++) {
+            set(e, "Preset", k);
+            std::string name = display(e, "Preset");
+            on(e, 48); run(e, 0.02); on(e, 55); auto a = run(e, 1.5); off(e, 55); off(e, 48); auto tl = run(e, 2.0);
+            send(e, 0xb0, 123, 0);
+            std::printf("  preset %-12s first 150 ms %6.1f dBFS, 1.5 s %6.1f dBFS, peak %.3f, 1-2 s after release %6.1f dBFS\n", name.c_str(), db(rms(a, 0, 0.15)), db(rms(a, 0)), peak(a), db(rms(tl, 1.0)));
+            CHECK(rms(a, 0) > 3e-3 && peak(a) <= 0.981, "preset %s silent or too hot", name.c_str());
+        }
+        set(e, "Preset", 1); set(e, "Cutoff", 77);
+        void *chunk = nullptr; intptr_t len = e->dispatcher(e, 23, 0, 0, &chunk, 0);
+        std::vector<uint8_t> copy((uint8_t *)chunk, (uint8_t *)chunk + len);
+        AEffect *e2 = mainf(master);
+        e2->dispatcher(e2, 24, 0, (intptr_t)copy.size(), copy.data(), 0);
+        CHECK(display(e2, "Preset") == "BASS" && display(e2, "Cutoff") == display(e, "Cutoff") && display(e2, "VCO2 Coarse") == display(e, "VCO2 Coarse"), "chunk after a preset loses the edit");
+        e2->dispatcher(e2, 1, 0, 0, nullptr, 0);
+        set(e, "Preset", 0);
+        int diff = 0; char b1[64], b2[64];
+        for (int i = 0; i < e->numParams; i++) { b1[0] = b2[0] = 0; e->dispatcher(e, 7, i, 0, b1, 0); fresh->dispatcher(fresh, 7, i, 0, b2, 0); if (std::strcmp(b1, b2)) diff++; }
+        CHECK(diff == 0, "INIT differs from the start patch in %d parameters", diff);
+        fresh->dispatcher(fresh, 1, 0, 0, nullptr, 0);
+        run(e, 12.0);
     }
 
     /* 7. everything up: stays below 0 dBFS */

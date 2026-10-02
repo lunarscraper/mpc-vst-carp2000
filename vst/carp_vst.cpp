@@ -1,10 +1,9 @@
 /* =============================================================================
  * carp_vst.cpp - carp 2000: a semi-modular synthesizer in the manner of the ARP 2600 as a VST2
- * instrument for the MPC OS plugin host (Force, MPC Live/One/X/Key), armhf. Phases 1 + 2 of the
- * README's roadmap: the monophonic voice (carp_core.h) - 3 VCOs, ring modulator, noise, filter
- * mixer, VCF, ADSR/AR, VCA, LFO, S&H, modulation matrix. This file is the plug-in around it:
- * parameters, MIDI (sample-accurate, last-note priority, single/multiple trigger, pitch bend
- * +-2, mod wheel, aftertouch), project chunk.
+ * instrument for the MPC OS plugin host (Force, MPC Live/One/X/Key), armhf. The voice and the spring
+ * reverb are carp_core.h; this file is the plug-in around them: parameters, presets, the voice
+ * modes (mono: newest key; duophonic: VCO 2 on the upper key; poly: four voices), MIDI
+ * (sample-accurate, single/multiple trigger, pitch bend +-2, mod wheel, aftertouch), project chunk.
  * MIT license (see ../LICENSE). "ARP" and "2600" are trademarks of their owners; no affiliation.
  * ========================================================================== */
 #include <algorithm>
@@ -78,7 +77,9 @@ enum {
     V1_FM_SH, V2_FM_SH, V3_PW, MIX_RING, NOISE_COLOR, REPEAT, VCA_RING,
     LFO_RATE, LFO_SHAPE, VIB_DEPTH, VIB_DELAY, SH_RATE, SH_SOURCE, SH_LAG,
     M1_SRC, M1_DST, M1_AMT, M2_SRC, M2_DST, M2_AMT, M3_SRC, M3_DST, M3_AMT,
-    M4_SRC, M4_DST, M4_AMT, M5_SRC, M5_DST, M5_AMT, M6_SRC, M6_DST, M6_AMT, NKEYS
+    M4_SRC, M4_DST, M4_AMT, M5_SRC, M5_DST, M5_AMT, M6_SRC, M6_DST, M6_AMT,
+    /* phase 3, appended */
+    REV_MIX, REV_LEN, VOICE_MODE, PRESET, NKEYS
 };
 static const char *const KEYS[NKEYS] = {
     "v1_coarse", "v1_fine", "v1_lf", "v1_fm_adsr", "v1_fm_vco2", "v1_kbd", "porta",
@@ -92,9 +93,13 @@ static const char *const KEYS[NKEYS] = {
     "lfo_rate", "lfo_shape", "vib_depth", "vib_delay", "sh_rate", "sh_source", "sh_lag",
     "m1_src", "m1_dst", "m1_amt", "m2_src", "m2_dst", "m2_amt", "m3_src", "m3_dst", "m3_amt",
     "m4_src", "m4_dst", "m4_amt", "m5_src", "m5_dst", "m5_amt", "m6_src", "m6_dst", "m6_amt",
+    "rev_mix", "rev_len", "voice_mode", "preset",
 };
 static int IDX[NKEYS];
 static int KEY_OF[NPARAMS];   /* PARAMS[] position -> key enum, -1 = not ours */
+
+enum { MODE_MONO, MODE_DUO, MODE_POLY };
+enum { NVOICES = 4, SEG = 1024 };
 
 struct MidiEv { int32_t frame; uint8_t d[3]; };
 
@@ -106,10 +111,15 @@ struct Plugin {
     float open[NPARAMS] = {0};
     volatile int release[NPARAMS] = {0};
     std::atomic<bool> dirty{true};
-    carp::Voice voice;
+    carp::Voice voice[NVOICES];
+    carp::Reverb reverb;
     carp::Patch patch;
     float sr = 44100;
     bool multi = false;
+    int mode = MODE_MONO;
+    int vnote[NVOICES] = {-1, -1, -1, -1};   /* poly: the key each voice plays, -1 = released */
+    uint32_t vage[NVOICES] = {0, 0, 0, 0}, clock = 0;
+    float send[SEG];
     MidiEv ev[256];
     int nev = 0;
     uint8_t held[32];             /* held keys, oldest first */
@@ -169,10 +179,12 @@ static float sq(float x) { return x * x; }
 static float law_semis(Plugin *w, int coarse, int fine) { return std::round(val(w, coarse)) + pct(w, fine); }
 static float law_time(float x, float lo, float ratio) { return lo * std::pow(ratio, x); }
 static float law_cutoff_oct(float x) { return x * 9.9657843f; }          /* 10 Hz .. 10 kHz */
+static float law_rev_s(float x) { return 0.4f * std::pow(10.0f, x); }        /* 0.4 .. 4 s */
 static float law_lfo_hz(float x) { return 0.05f * std::pow(1000.0f, x); }   /* 0.05 .. 50 Hz */
 static float law_sh_hz(float x) { return 0.1f * std::pow(1000.0f, x); }     /* 0.1 .. 100 Hz */
 static float vco_hz(float semis, bool lf) { return 440.0f * std::pow(2.0f, (semis - 69) / 12) * (lf ? 0.003f : 1.0f); }
 
+static void all_off(Plugin *w);
 static void configure(Plugin *w) {
     carp::Patch &p = w->patch;
     static const int C[3] = {V1_COARSE, V2_COARSE, V3_COARSE}, F[3] = {V1_FINE, V2_FINE, V3_FINE};
@@ -227,39 +239,90 @@ static void configure(Plugin *w) {
         p.slot[i].dst = clampi((int)val(w, M1_DST + 3 * i), 0, carp::NDST - 1);
         p.slot[i].amt = carp::clampf(val(w, M1_AMT + 3 * i) / 100.0f, -1, 1);
     }
+    p.rev = sq(pct(w, REV_MIX));
+    w->reverb.set_length(law_rev_s(pct(w, REV_LEN)));
     w->multi = sw(w, TRIG);
-    w->voice.set_patch(p);
+    const int mode = clampi((int)val(w, VOICE_MODE), 0, 2);
+    if (mode != w->mode) { all_off(w); w->mode = mode; }
+    w->voice[0].set_patch(p);
+    /* the other three voices only sound in poly; a drone (initial gain, REPEAT AUTO) stays one voice */
+    carp::Patch q = p;
+    q.gain = 0;
+    if (q.repeat == carp::REPEAT_AUTO) q.repeat = carp::REPEAT_KEY;
+    for (int v = 1; v < NVOICES; v++) w->voice[v].set_patch(q);
 }
 
-/* ---- MIDI: one voice, the newest held key sounds --------------------------- */
-static void all_off(Plugin *w) { w->nheld = 0; w->voice.note_off(); }
+/* ---- MIDI ------------------------------------------------------------------ */
+static void all_off(Plugin *w) {
+    w->nheld = 0;
+    for (int v = 0; v < NVOICES; v++) { w->voice[v].note_off(); w->vnote[v] = -1; }
+}
+static int nvoices(Plugin *w) { return w->mode == MODE_POLY ? NVOICES : 1; }
+/* mono: the newest held key. duophonic: the lowest key plays, VCO 2 takes the highest */
+static void solo_keys(Plugin *w, float vel, bool retrigger) {
+    const int k = w->nheld;
+    if (w->mode == MODE_DUO) {
+        int lo = 127, hi = 0;
+        for (int i = 0; i < k; i++) { lo = std::min(lo, (int)w->held[i]); hi = std::max(hi, (int)w->held[i]); }
+        w->voice[0].note_on(lo, vel, retrigger);
+        w->voice[0].set_upper(hi);
+    } else w->voice[0].note_on(w->held[k - 1], vel, retrigger);
+}
+static void poly_on(Plugin *w, int n, float vel) {
+    int pick = -1;
+    for (int v = 0; v < NVOICES; v++) if (w->vnote[v] == n) pick = v;            /* the same key again */
+    if (pick < 0) {                                                             /* a silent voice, else the longest released, */
+        for (int v = 0; v < NVOICES; v++) if (w->vnote[v] < 0 && w->voice[v].idle() && (pick < 0 || w->vage[v] < w->vage[pick])) pick = v;
+    }
+    if (pick < 0) for (int v = 0; v < NVOICES; v++) if (w->vnote[v] < 0 && (pick < 0 || w->vage[v] < w->vage[pick])) pick = v;
+    if (pick < 0) { pick = 0; for (int v = 1; v < NVOICES; v++) if (w->vage[v] < w->vage[pick]) pick = v; }   /* else the oldest key */
+    w->vnote[pick] = n; w->vage[pick] = ++w->clock;
+    w->voice[pick].note_on(n, vel, true);
+}
 static void midi(Plugin *w, const uint8_t *d) {
     const int st = d[0] & 0xf0, n = d[1] & 0x7f;
     if (st == 0x90 && d[2] > 0) {
+        if (w->mode == MODE_POLY) { poly_on(w, n, d[2] / 127.0f); return; }
         int k = 0;
         for (int i = 0; i < w->nheld; i++) if (w->held[i] != n) w->held[k++] = w->held[i];
         if (k == 32) { std::memmove(w->held, w->held + 1, 31); k = 31; }
         const bool legato = k > 0;
         w->held[k++] = (uint8_t)n;
         w->nheld = k;
-        w->voice.note_on(n, d[2] / 127.0f, !legato || w->multi);
+        solo_keys(w, d[2] / 127.0f, !legato || w->multi);
     } else if (st == 0x80 || st == 0x90) {
-        if (!w->nheld) return;
-        const bool top = w->held[w->nheld - 1] == n;
+        if (w->mode == MODE_POLY) {
+            for (int v = 0; v < NVOICES; v++) if (w->vnote[v] == n) { w->vnote[v] = -1; w->vage[v] = ++w->clock; w->voice[v].note_off(); }
+            return;
+        }
         int k = 0;
         for (int i = 0; i < w->nheld; i++) if (w->held[i] != n) w->held[k++] = w->held[i];
         if (k == w->nheld) return;
         w->nheld = k;
-        if (!k) w->voice.note_off();
-        else if (top) w->voice.note_on(w->held[k - 1], 1.0f, false);   /* back to the key still held */
+        if (!k) w->voice[0].note_off();
+        else solo_keys(w, 1.0f, false);                 /* back to the keys still held, no new attack */
     } else if (st == 0xe0) {
-        w->voice.set_bend(((((int)d[2] & 0x7f) << 7 | (d[1] & 0x7f)) - 8192) * (2.0f / 8192.0f));
+        const float b = ((((int)d[2] & 0x7f) << 7 | (d[1] & 0x7f)) - 8192) * (2.0f / 8192.0f);
+        for (int v = 0; v < NVOICES; v++) w->voice[v].set_bend(b);
     } else if (st == 0xd0) {
-        w->voice.set_aftertouch(n / 127.0f);
+        for (int v = 0; v < NVOICES; v++) w->voice[v].set_aftertouch(n / 127.0f);
     } else if (st == 0xb0 && n == 1) {
-        w->voice.set_wheel((d[2] & 0x7f) / 127.0f);
+        for (int v = 0; v < NVOICES; v++) w->voice[v].set_wheel((d[2] & 0x7f) / 127.0f);
     } else if (st == 0xb0 && (n == 120 || n == 123)) {
         all_off(w);
+    }
+}
+
+/* voices -> send -> spring; L and R must be zeroed by the caller */
+static void render(Plugin *w, float *L, float *R, int n) {
+    const int nv = nvoices(w);
+    const float g = w->mode == MODE_POLY ? 0.7f : 1.0f;      /* headroom for four voices */
+    for (int pos = 0; pos < n; pos += SEG) {
+        const int m = std::min((int)SEG, n - pos);
+        std::memset(w->send, 0, sizeof(float) * (size_t)m);
+        for (int v = 0; v < nv; v++) w->voice[v].render(L + pos, R + pos, w->send, m);
+        if (g != 1.0f) for (int i = 0; i < m; i++) { L[pos + i] *= g; R[pos + i] *= g; w->send[i] *= g; }
+        w->reverb.process(w->send, L + pos, R + pos, m);
     }
 }
 
@@ -268,15 +331,19 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     NoDenormals nd;
     if (w->dirty.exchange(false)) configure(w);
     float *L = out[0], *R = out[1];
+    std::memset(L, 0, sizeof(float) * (size_t)n);
+    std::memset(R, 0, sizeof(float) * (size_t)n);
     int pos = 0;
     for (int k = 0; k < w->nev; k++) {
         const int f = clampi(w->ev[k].frame, pos, n);
-        if (f > pos) { w->voice.render(L + pos, R + pos, f - pos); pos = f; }
+        if (f > pos) { render(w, L + pos, R + pos, f - pos); pos = f; }
         midi(w, w->ev[k].d);
     }
     w->nev = 0;
-    if (n > pos) w->voice.render(L + pos, R + pos, n - pos);
-    if (!w->voice.idle()) {
+    if (n > pos) render(w, L + pos, R + pos, n - pos);
+    bool sounding = w->reverb.active();
+    for (int v = 0; v < nvoices(w); v++) sounding = sounding || !w->voice[v].idle();
+    if (sounding) {
         for (int c = 0; c < 2; c++) {
             float *y = out[c];
             for (int i = 0; i < n; i++) {
@@ -312,6 +379,44 @@ static intptr_t process_events(Plugin *w, const VstEvents *evs) {
     return 1;
 }
 
+/* ---- presets: the start patch plus these changes (units of module.json) ---- */
+struct PV { int key; float v; };
+static const PV PRE_1[] = {{V1_COARSE, 48}, {V2_COARSE, 36}, {V2_FINE, 5}, {V2_PW, 38}, {MIX_V1SAW, 80}, {MIX_V2PULSE, 70}, {CUTOFF, 40}, {RESO, 35}, {F_KBD, 40}, {F_ADSR, 50}, {DRIVE, 45}, {DECAY, 45}, {SUSTAIN, 55}, {RELEASE, 25}, {F_VEL, 20}, {VOLUME, 90}};   /* BASS */
+static const PV PRE_2[] = {{V2_COARSE, 60}, {V2_FINE, 8}, {V3_FINE, -8}, {MIX_V1SAW, 70}, {MIX_V2PULSE, 0}, {MIX_V3SAW, 70}, {CUTOFF, 62}, {RESO, 30}, {F_ADSR, 30}, {PORTA, 25}, {VIB_DEPTH, 35}, {VIB_DELAY, 40}, {SUSTAIN, 80}, {RELEASE, 35}, {REV_MIX, 40}};   /* LEAD */
+static const PV PRE_3[] = {{MIX_V1SAW, 0}, {MIX_V2PULSE, 0}, {MIX_V2TRI, 100}, {V2_COARSE, 36}, {V2_FM_ADSR, 75}, {CUTOFF, 45}, {RESO, 0}, {F_KBD, 0}, {F_ADSR, 35}, {DRIVE, 60}, {DECAY, 47}, {SUSTAIN, 0}, {RELEASE, 47}, {VOLUME, 100}, {TRIG, 1}};   /* KICK */
+static const PV PRE_4[] = {{MIX_V1SAW, 0}, {MIX_V2PULSE, 0}, {MIX_V2TRI, 60}, {MIX_NOISE, 100}, {V2_COARSE, 55}, {V2_FM_ADSR, 45}, {CUTOFF, 85}, {RESO, 10}, {F_KBD, 0}, {F_ADSR, 0}, {DECAY, 40}, {SUSTAIN, 0}, {RELEASE, 40}, {VOLUME, 100}, {TRIG, 1}, {REV_MIX, 35}, {REV_LEN, 30}};   /* SNARE */
+static const PV PRE_5[] = {{MIX_V2PULSE, 0}, {MIX_V1SAW, 90}, {CUTOFF, 48}, {RESO, 72}, {F_ADSR, 15}, {DECAY, 38}, {SUSTAIN, 0}, {RELEASE, 38}, {VOLUME, 100}, {REPEAT, 1}, {LFO_RATE, 73.5}, {SH_RATE, 63.4}, {M1_SRC, 5}, {M1_DST, 5}, {M1_AMT, 65}, {REV_MIX, 30}};   /* S&H BUBBLES */
+static const PV PRE_6[] = {{MIX_V1SAW, 0}, {MIX_V2PULSE, 0}, {MIX_RING, 100}, {V2_COARSE, 67}, {V2_FINE, 30}, {CUTOFF, 85}, {RESO, 0}, {F_ADSR, 0}, {DECAY, 68}, {SUSTAIN, 0}, {RELEASE, 66}, {REV_MIX, 50}, {REV_LEN, 70}};   /* RING BELL */
+static const PV PRE_7[] = {{MIX_V2PULSE, 0}, {MIX_V1SAW, 90}, {V3_COARSE, 79}, {V3_PW, 30}, {M1_SRC, 3}, {M1_DST, 0}, {M1_AMT, 35}, {M2_SRC, 12}, {M2_DST, 5}, {M2_AMT, 50}, {CUTOFF, 62}, {RESO, 40}, {F_ADSR, 30}};   /* CROSS MOD */
+static const PV PRE_8[] = {{MIX_V1SAW, 0}, {MIX_V2PULSE, 0}, {MIX_NOISE, 100}, {NOISE_COLOR, 50}, {CUTOFF, 58}, {RESO, 85}, {F_ADSR, 0}, {F_KBD, 0}, {VCA_GAIN, 55}, {VCA_ADSR, 0}, {LFO_RATE, 20}, {LFO_SHAPE, 1}, {SH_RATE, 30}, {SH_LAG, 80}, {M1_SRC, 8}, {M1_DST, 5}, {M1_AMT, 35}, {M2_SRC, 5}, {M2_DST, 5}, {M2_AMT, 30}, {M3_SRC, 5}, {M3_DST, 7}, {M3_AMT, 30}, {REV_MIX, 50}, {REV_LEN, 75}};   /* WIND */
+static const PV PRE_9[] = {{V1_COARSE, 36}, {V2_COARSE, 36}, {V2_FINE, 6}, {CUTOFF, 42}, {RESO, 50}, {F_ADSR, 45}, {DECAY, 34}, {SUSTAIN, 0}, {RELEASE, 34}, {REPEAT, 2}, {LFO_RATE, 67}, {M1_SRC, 5}, {M1_DST, 0}, {M1_AMT, 40}, {SH_RATE, 50}, {REV_MIX, 30}};   /* AUTO PULSE */
+static const PV PRE_10[] = {{VOICE_MODE, 2}, {V2_COARSE, 60}, {V2_FINE, 9}, {V2_PW, 30}, {MIX_V1SAW, 60}, {MIX_V2PULSE, 50}, {CUTOFF, 52}, {RESO, 15}, {F_ADSR, 25}, {ATTACK, 58}, {DECAY, 65}, {SUSTAIN, 75}, {RELEASE, 62}, {LFO_RATE, 35}, {LFO_SHAPE, 1}, {M1_SRC, 8}, {M1_DST, 3}, {M1_AMT, 55}, {REV_MIX, 55}, {REV_LEN, 70}};   /* POLY PAD */
+static const PV PRE_11[] = {{VOICE_MODE, 1}, {V2_COARSE, 60}, {V2_PW, 35}, {MIX_V1SAW, 80}, {MIX_V2PULSE, 70}, {CUTOFF, 60}, {RESO, 25}, {F_ADSR, 30}, {SUSTAIN, 80}, {RELEASE, 35}, {TRIG, 1}, {REV_MIX, 35}};   /* DUO LEAD */
+static const PV PRE_12[] = {{MIX_V2PULSE, 0}, {MIX_V1SQ, 80}, {MIX_V1SAW, 0}, {V1_FM_ADSR, 85}, {CUTOFF, 80}, {RESO, 60}, {F_ADSR, 0}, {DECAY, 48}, {SUSTAIN, 0}, {RELEASE, 48}, {TRIG, 1}, {REV_MIX, 40}};   /* LASER */
+static const struct { const PV *pv; int n; } PRESETS[] = {
+    {nullptr, 0},
+    {PRE_1, (int)(sizeof PRE_1 / sizeof(PV))},
+    {PRE_2, (int)(sizeof PRE_2 / sizeof(PV))},
+    {PRE_3, (int)(sizeof PRE_3 / sizeof(PV))},
+    {PRE_4, (int)(sizeof PRE_4 / sizeof(PV))},
+    {PRE_5, (int)(sizeof PRE_5 / sizeof(PV))},
+    {PRE_6, (int)(sizeof PRE_6 / sizeof(PV))},
+    {PRE_7, (int)(sizeof PRE_7 / sizeof(PV))},
+    {PRE_8, (int)(sizeof PRE_8 / sizeof(PV))},
+    {PRE_9, (int)(sizeof PRE_9 / sizeof(PV))},
+    {PRE_10, (int)(sizeof PRE_10 / sizeof(PV))},
+    {PRE_11, (int)(sizeof PRE_11 / sizeof(PV))},
+    {PRE_12, (int)(sizeof PRE_12 / sizeof(PV))},
+};
+static void start_values(Plugin *w);
+static void load_preset(Plugin *w, int n) {
+    if (n < 0 || n >= (int)(sizeof PRESETS / sizeof PRESETS[0])) return;
+    start_values(w);
+    for (int i = 0; i < PRESETS[n].n; i++) start(w, PRESETS[n].pv[i].key, PRESETS[n].pv[i].v);
+    start(w, PRESET, n);
+    w->dirty.store(true);
+}
+
 static void setParameter(AEffect *e, int32_t i, float n) {
     Plugin *w = (Plugin *)e->object;
     if (i < 0 || i >= NPARAMS) return;
@@ -326,7 +431,9 @@ static void setParameter(AEffect *e, int32_t i, float n) {
             nudge = true;
         }
     }
+    const int before = norm_to_ui(p, w->cache[i].load());
     w->cache[i].store(clamp01(n));
+    if (KEY_OF[i] == PRESET && norm_to_ui(p, clamp01(n)) != before) load_preset(w, norm_to_ui(p, clamp01(n)));
     w->dirty.store(true);
     if (!nudge) popup_picked(w->open, w->release, i);
 }
@@ -399,6 +506,7 @@ static void display(Plugin *w, int idx, char *buf, size_t n) {
     case ATTACK: case AR_ATTACK: fmt_time(buf, n, law_time(x, 0.001f, 5000)); break;
     case DECAY: case RELEASE: case AR_RELEASE: fmt_time(buf, n, law_time(x, 0.005f, 2000)); break;
     case VIB_DELAY: fmt_time(buf, n, 3 * sq(x)); break;
+    case REV_LEN: fmt_time(buf, n, law_rev_s(x)); break;
     case SH_LAG: fmt_time(buf, n, sq(x)); break;
     case LFO_RATE: fmt_hz(buf, n, law_lfo_hz(x)); break;
     case SH_RATE: fmt_hz(buf, n, law_sh_hz(x)); break;
@@ -430,7 +538,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         return 1;
     }
     case effSetSampleRate:
-        if (o > 0) { w->sr = o; w->voice.init(o); w->nheld = 0; w->dirty.store(true); }
+        if (o > 0) { w->sr = o; for (int v = 0; v < NVOICES; v++) w->voice[v].init(o); w->reverb.init(o); all_off(w); w->dirty.store(true); }
         return 1;
     case effSetBlockSize: return 1;
     case effMainsChanged: if (!v) all_off(w); return 1;
@@ -463,6 +571,7 @@ static void start_values(Plugin *w) {
     start(w, LFO_RATE, 67); start(w, LFO_SHAPE, 0); start(w, VIB_DEPTH, 0); start(w, VIB_DELAY, 0);
     start(w, SH_RATE, 63); start(w, SH_SOURCE, 0); start(w, SH_LAG, 0);
     for (int i = 0; i < carp::NSLOTS; i++) { start(w, M1_SRC + 3 * i, 0); start(w, M1_DST + 3 * i, carp::DST_CUTOFF); start(w, M1_AMT + 3 * i, 0); }
+    start(w, REV_MIX, 0); start(w, REV_LEN, 50); start(w, VOICE_MODE, 0); start(w, PRESET, 0);
     start(w, VCA_GAIN, 0); start(w, VCA_AR, 0); start(w, VCA_ADSR, 100); start(w, PAN, 0); start(w, VOLUME, 80);
 }
 
@@ -476,7 +585,8 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     w->master = master;
     for (int i = 0; i < NPARAMS; i++) { w->cache[i].store(PARAMS[i].def); w->notify[i].store(0); }
     start_values(w);
-    w->voice.init(w->sr);
+    for (int v = 0; v < NVOICES; v++) w->voice[v].init(w->sr);
+    w->reverb.init(w->sr);
     AEffect *e = &w->fx;
     std::memset(e, 0, sizeof *e);
     e->magic = 0x56737450;
