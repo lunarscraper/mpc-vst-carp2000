@@ -4,7 +4,7 @@ Repo: `mpc-vst-carp2000`
 
 Semi-modularer Synthesizer nach dem Vorbild des ARP 2600 als VST2-Plugin für Akai Force und MPC (Standalone), gebaut auf dem mpc-vst-plugins-Gerüst (DPF).
 
-**Status:** Phase 1 (monophone Grundstimme) umgesetzt, siehe [Stand Phase 1](#stand-phase-1). Phase 2 und 3 sind Konzept.
+**Status:** Phase 1 (monophone Grundstimme) und Phase 2 (Modulation) umgesetzt, siehe [Stand](#stand). Phase 3 ist Konzept.
 
 ## Idee
 
@@ -203,18 +203,11 @@ Sechs Slots, je **Quelle**, **Ziel**, **Stärke** (−100 … +100 %). Die negat
 2. **Modulation:** LFO, S&H, Ringmodulator, Rauschfarbe, Matrix.
 3. **Ausbau:** Federhall, Duophonie, Poly 4, Presets.
 
-## Stand Phase 1
+## Stand
 
 Code in `vst/`: `carp_core.h` (die Stimme), `carp_vst.cpp` (Plugin, MIDI, Projekt-Chunk), `host_test.cpp` (Offline-Test und Benchmark). Bauen über GitHub Actions („VST release (draft)") oder lokal mit `vst/build.sh`, danach `vst/test.sh`.
 
-Enthalten sind die Seiten 1 bis 7 ohne die Regler, deren Quelle oder Ziel erst später kommt:
-
-| Fehlt noch | Kommt mit |
-|---|---|
-| FM S&H (VCO 1, VCO 2), Repeat, Seite 8 | Phase 2 (LFO, S&H) |
-| Ringmodulator im Mixer und direkt auf den VCA, Rauschfarbe | Phase 2 |
-| Pulsbreite VCO 3 | Phase 2 (VCO 3 Puls ist nur über die Matrix hörbar) |
-| Hall-Anteil, Hall-Länge, Stimmenmodus | Phase 3 |
+Umgesetzt sind die Seiten 1 bis 8 und die Matrix. Es fehlen nur die Regler aus Phase 3: Hall-Anteil, Hall-Länge und Stimmenmodus.
 
 Festlegungen, die das Konzept offen ließ:
 
@@ -223,9 +216,16 @@ Festlegungen, die das Konzept offen ließ:
 - **Tastatur:** eine Stimme, die zuletzt gedrückte Taste klingt. Trigger „single" löst bei gebundenem Spiel nicht neu aus, „multiple" bei jeder Taste. Pitchbend ± 2 Halbtöne.
 - **Filtertyp:** 4012 reicht bis 18 kHz, 4072 endet wie das Original bei etwa 11 kHz. Weitere Unterschiede der beiden Schaltungen sind nicht modelliert.
 - **Dreieck von VCO 2** ist nicht bandbegrenzt (Obertöne fallen mit 1/n², Aliasing bleibt gering).
-- Neue Parameter späterer Phasen werden hinten angehängt. Projekte speichern nach Schlüssel und bleiben ladbar.
+- **Repeat** hat drei Stellungen: OFF, KEY (das LFO-Rechteck ist das Gate, solange eine Taste gehalten wird) und AUTO (auch ohne Taste). Der Takt kommt wie im Konzept vom LFO, nicht von der S&H-Clock.
+- **LFO** 0,05 – 50 Hz, **S&H-Clock** 0,1 – 100 Hz. Vibrato bis ± 2 Halbtöne auf alle VCOs, die der Tastatur folgen; nach dem Delay wird es eingeblendet.
+- **Rauschfarbe** wirkt auf alles, was Rauschen nutzt (Mixer, FM, PWM, S&H, Matrix).
+- **Ringmodulator** ohne AC/DC-Schalter: Auf den acht Seiten ist kein Platz dafür, und bei Sägezahn × Sinus ist der Unterschied klein.
+- **Matrix-Quellen:** VCO 1 liefert den Sägezahn, VCO 2 den Sinus, VCO 3 den Puls (dafür ist dessen Pulsbreite da). Diese drei und das Rauschen modulieren in Audiorate, alle anderen im Kontrolltakt. LFO-Rate und S&H-Rate nehmen auch Audioquellen nur im Kontrolltakt an.
+- **Matrix-Stärke** quadratisch (feinfühlig um 0). ± 100 % entsprechen ± 4 Oktaven Tonhöhe, ± 5 Oktaven Cutoff, ± 40 % Pulsbreite, der vollen Resonanz, dem vollen VCA-Pegel, voll links/rechts und ± 4 Oktaven Rate.
+- **Matrix-Ziel REVERB** ist schon wählbar, wirkt aber erst mit Phase 3.
+- Neue Parameter werden hinten angehängt. Projekte speichern nach Schlüssel und bleiben ladbar.
 
-CPU-Last im Offline-Benchmark auf einem x86-Kern: 0,4 % für das Startpatch, 0,7 % im ungünstigsten Fall. Die Messung auf der Force steht aus.
+CPU-Last im Offline-Benchmark auf einem x86-Kern: etwa 0,5 % für das Startpatch, 1 % im ungünstigsten Fall (alle Quellen, sechs Matrix-Slots in Audiorate).
 
 ## Nicht enthalten
 

@@ -1,8 +1,9 @@
 /* Offline x86 test of carp_vst.cpp (test.sh builds it with ASan/UBSan): silence without a key,
  * tuning (VCO, coarse, pitch bend), the filter (darkening, keyboard-tracked self-oscillation,
  * 4072 ceiling), ADSR/AR/VCA (sustain, release, initial gain), mono key handling (last note,
- * single/multiple trigger), LF mode, cross FM, pan, output ceiling, chunk restore, a random
- * parameter/MIDI stress run, NaN/denormal-free output.
+ * single/multiple trigger), LF mode, cross FM, pan, ring modulator, noise colour, LFO vibrato
+ * with delay, S&H, REPEAT, the modulation matrix at control and audio rate, output ceiling,
+ * chunk restore, a random parameter/MIDI stress run, NaN/denormal-free output.
  * With "bench" as the second argument it only measures CPU load. Prints PASSED/FAILED. */
 #include <chrono>
 #include <cmath>
@@ -58,6 +59,10 @@ static void set(AEffect *e, const char *name, double v) {
     else if (ends("Fine")) { lo = -100; hi = 100; }
     else if (ends("Pulse Width")) { lo = 10; hi = 90; }
     else if (s == "Pan") { lo = -50; hi = 50; }
+    else if (ends("Amount")) { lo = -100; hi = 100; }
+    else if (ends("Source") && s != "S&H Source") { hi = 12; }
+    else if (ends("Dest")) { hi = 11; }
+    else if (s == "LFO Shape" || s == "S&H Source" || s == "Repeat") { hi = 2; }
     else if (ends(" LF") || (ends("Keyboard") && s != "VCF Keyboard") || s == "VCF Type" || s == "Trigger") { hi = 1; }
     e->setParameter(e, param(e, name), (float)((v - lo) / (hi - lo)));
 }
@@ -110,14 +115,18 @@ static void plain(AEffect *e) {
     for (const char *k : {"Mix VCO1 Square", "Mix VCO2 Pulse", "Mix VCO3 Saw", "Mix Noise", "Mix VCO2 Triangle", "Resonance",
                           "VCF Keyboard", "VCF ADSR", "VCF FM VCO2", "VCF Velocity", "VCO1 FM ADSR", "VCO1 FM VCO2", "VCO2 FM ADSR",
                           "VCO2 FM VCO1", "VCO2 PWM Noise", "VCO3 FM Noise", "VCO3 FM ADSR", "VCO3 FM VCO2", "Portamento",
-                          "ADSR Attack", "ADSR Release", "AR Attack", "AR Release", "VCA Initial Gain", "VCA AR", "VCF Drive"}) set(e, k, 0);
+                          "ADSR Attack", "ADSR Release", "AR Attack", "AR Release", "VCA Initial Gain", "VCA AR", "VCF Drive",
+                          "VCO1 FM S&H", "VCO2 FM S&H", "Mix Ring Mod", "Noise Color", "VCA Ring Mod", "Vibrato Depth", "Vibrato Delay", "S&H Lag",
+                          "Repeat", "LFO Shape", "S&H Source"}) set(e, k, 0);
+    for (int i = 1; i <= 6; i++) { char b[32]; std::snprintf(b, sizeof b, "Mod %d Source", i); set(e, b, 0); std::snprintf(b, sizeof b, "Mod %d Amount", i); set(e, b, 0); }
+    set(e, "LFO Rate", 67); set(e, "S&H Rate", 63); set(e, "VCO3 Pulse Width", 50);
     for (const char *k : {"VCO1 LF", "VCO2 LF", "VCO3 LF", "VCF Type", "Trigger"}) set(e, k, 0);
     for (const char *k : {"VCO1 Keyboard", "VCO3 Keyboard"}) set(e, k, 1);
     for (const char *k : {"VCO1 Coarse", "VCO2 Coarse", "VCO3 Coarse"}) set(e, k, 60);
     for (const char *k : {"VCO1 Fine", "VCO2 Fine", "VCO3 Fine", "Pan"}) set(e, k, 0);
     set(e, "Mix VCO1 Saw", 100); set(e, "Cutoff", 100); set(e, "ADSR Sustain", 100); set(e, "ADSR Decay", 50);
     set(e, "VCA ADSR", 100); set(e, "Volume", 80); set(e, "VCO2 Pulse Width", 50);
-    send(e, 0xb0, 123, 0); send(e, 0xe0, 0, 64);
+    send(e, 0xb0, 123, 0); send(e, 0xe0, 0, 64); send(e, 0xb0, 1, 0); send(e, 0xd0, 0, 0);
     run(e, 0.3);
 }
 
@@ -130,12 +139,18 @@ int main(int argc, char **argv) {
     e->dispatcher(e, 0, 0, 0, nullptr, 0);
     e->dispatcher(e, 10, 0, 0, nullptr, SR);
     if (argc > 2 && !std::strcmp(argv[2], "bench")) {
-        struct { const char *what; int mode; } B[] = {{"idle (no key)", 0}, {"start patch, key held", 1}, {"worst case: 3 VCOs, all FM, filter FM, noise", 2}};
+        struct { const char *what; int mode; } B[] = {{"idle (no key)", 0}, {"start patch, key held", 1}, {"worst case: all sources, all FM, 6 audio-rate slots", 2}};
         for (auto &b : B) {
             if (b.mode >= 1) on(e, 45);
             if (b.mode == 2) {
                 for (const char *k : {"Mix VCO1 Square", "Mix VCO2 Pulse", "Mix VCO3 Saw", "Mix Noise", "Mix VCO1 Saw", "Mix VCO2 Triangle"}) set(e, k, 70);
-                for (const char *k : {"VCO1 FM VCO2", "VCO2 FM VCO1", "VCO3 FM VCO2", "VCO3 FM Noise", "VCF FM VCO2", "VCO2 PWM Noise", "Resonance"}) set(e, k, 40);
+                for (const char *k : {"VCO1 FM VCO2", "VCO2 FM VCO1", "VCO3 FM VCO2", "VCO3 FM Noise", "VCF FM VCO2", "VCO2 PWM Noise", "Resonance", "Mix Ring Mod", "Noise Color", "VCO1 FM S&H"}) set(e, k, 40);
+                for (int i = 1; i <= 6; i++) {   /* six audio-rate slots: VCO 1..3 and noise onto pitch, pulse width, cutoff, resonance, VCA, pan */
+                    char b[32]; static const int D[6] = {0, 4, 5, 6, 7, 8};
+                    std::snprintf(b, sizeof b, "Mod %d Source", i); set(e, b, 1 + i % 4);
+                    std::snprintf(b, sizeof b, "Mod %d Dest", i); set(e, b, D[i - 1]);
+                    std::snprintf(b, sizeof b, "Mod %d Amount", i); set(e, b, 30);
+                }
             }
             auto t0 = std::chrono::steady_clock::now();
             run(e, 20.0);
@@ -276,6 +291,115 @@ int main(int argc, char **argv) {
         Buf R2; set(e, "Pan", 50); auto L2 = run(e, 0.4, &R2);
         std::printf("  pan: left %.4f/%.6f, right %.6f/%.4f\n", l, r, rms(L2, 0.2), rms(R2, 0.2));
         CHECK(l > 0.05 && r < 1e-3 && rms(R2, 0.2) > 0.05 && rms(L2, 0.2) < 1e-3, "pan wrong");
+        off(e, 69);
+    }
+
+    /* P2.1 ring modulator = VCO 1 saw x VCO 2 sine: sum and difference, no carrier; in the mixer and direct */
+    plain(e);
+    {
+        enum { SRC_VCO3 = 3, SRC_NOISE = 4, SRC_SH = 5, SRC_ADSR = 6, SRC_LFO = 8, SRC_VEL = 10, SRC_AT = 11, SRC_WHEEL = 12 };
+        enum { DST_P1 = 0, DST_PW3 = 4, DST_CUTOFF = 5, DST_VCA = 7, DST_PAN = 8, DST_LFO_RATE = 10 };
+        (void)SRC_NOISE; (void)DST_PW3;
+        set(e, "Mix VCO1 Saw", 0); set(e, "VCO2 Coarse", 48);      /* VCO 1 440 Hz, VCO 2 220 Hz at A4 */
+        double c[2], sb[2];
+        for (int k = 0; k < 2; k++) {
+            set(e, "Mix Ring Mod", k ? 0 : 100); set(e, "VCA Ring Mod", k ? 100 : 0);
+            on(e, 69); auto a = run(e, 0.8); off(e, 69); run(e, 0.2);
+            c[k] = goertzel(a, 440); sb[k] = goertzel(a, 660);
+            /* saw harmonic n*440 +- 220: all odd multiples of 220, none of the even ones */
+            std::printf("  ring %s: 660 Hz %.1f dBFS, 440 Hz %.1f dBFS\n", k ? "direct" : "in mixer", db(sb[k]), db(c[k]));
+            CHECK(sb[k] > 0.02 && c[k] < 0.05 * sb[k], "ring modulator wrong");
+        }
+        set(e, "VCA Ring Mod", 0);
+
+        /* P2.2 noise colour: red has far less treble than white */
+        set(e, "Mix Noise", 100); double hf[3];
+        for (int k = 0; k < 3; k++) {
+            set(e, "Noise Color", 50 * k); on(e, 60); auto a = run(e, 1.0); off(e, 60); run(e, 0.2);
+            double d = 0; for (size_t i = 4410; i + 1 < a.size(); i++) d += std::fabs(a[i + 1] - a[i]);
+            hf[k] = d / (a.size() - 4411) / rms(a);
+            std::printf("  noise colour %3d: %.1f dBFS, treble measure %.3f\n", 50 * k, db(rms(a)), hf[k]);
+        }
+        CHECK(hf[1] < 0.8 * hf[0] && hf[2] < 0.4 * hf[1], "noise colour does not darken");
+    }
+
+    /* P2.3 LFO vibrato and its delay; S&H steps the pitch */
+    plain(e);
+    {
+        on(e, 69); run(e, 0.3); double c0 = goertzel(run(e, 1.0), 440); off(e, 69); run(e, 0.2);
+        set(e, "Vibrato Depth", 80); set(e, "Vibrato Delay", 60);
+        on(e, 69); auto a = run(e, 0.9); auto b = run(e, 2.0); off(e, 69); run(e, 0.2);
+        double early = goertzel(a, 440), late = goertzel(b, 440, 1.0);
+        std::printf("  vibrato, delay %s: 440 Hz line %.1f dB early, %.1f dB late (LFO %s)\n", display(e, "Vibrato Delay").c_str(), db(early / c0), db(late / c0), display(e, "LFO Rate").c_str());
+        CHECK(early > 0.9 * c0 && late < 0.7 * c0, "vibrato or its delay wrong");
+        set(e, "Vibrato Depth", 0);
+        set(e, "VCO1 FM S&H", 60); on(e, 69); a = run(e, 2.0); off(e, 69); run(e, 0.2);
+        std::printf("  S&H (%s) on VCO 1: 440 Hz line %.1f dB\n", display(e, "S&H Rate").c_str(), db(goertzel(a, 440) / c0));
+        CHECK(goertzel(a, 440) < 0.5 * c0, "S&H FM has no effect");
+        /* with full lag at a slow clock the steps turn into slow drift: successive short windows change little */
+        set(e, "VCO1 FM S&H", 0);
+    }
+
+    /* P2.4 REPEAT: the LFO square gates the envelopes; KEY needs a key, AUTO does not */
+    plain(e);
+    {
+        set(e, "LFO Rate", 67); set(e, "ADSR Sustain", 0); set(e, "ADSR Decay", 30);   /* ~5 Hz, short blips */
+        set(e, "Repeat", 1);
+        double q = rms(run(e, 1.0), 0);
+        on(e, 57); auto a = run(e, 2.0); off(e, 57); run(e, 0.5);
+        int bursts = 0; bool hi = false;
+        for (size_t i = 0; i + 441 < a.size(); i += 441) { double r = 0; for (int j = 0; j < 441; j++) r += std::fabs(a[i + j]); r /= 441; if (r > 0.05 && !hi) { hi = true; bursts++; } else if (r < 0.01) hi = false; }
+        set(e, "Repeat", 2); double au = rms(run(e, 1.0), 0);
+        set(e, "Repeat", 0); double z = rms(run(e, 1.0), 0.6);
+        std::printf("  repeat KEY: silent without key %.6f, %d blips in 2 s with key; AUTO without key %.4f; off %.6f\n", q, bursts, au, z);
+        CHECK(q == 0 && bursts >= 8 && bursts <= 12 && au > 0.01 && z < 1e-4, "repeat wrong");
+    }
+
+    /* P2.5 matrix */
+    plain(e);
+    {
+        enum { SRC_VCO3 = 3, SRC_ADSR = 6, SRC_LFO = 8, SRC_VEL = 10, SRC_AT = 11, SRC_WHEEL = 12 };
+        enum { DST_P1 = 0, DST_CUTOFF = 5, DST_VCA = 7, DST_PAN = 8 };
+        on(e, 69); run(e, 0.3); auto ref = run(e, 1.0); double c0 = goertzel(ref, 440), h0 = goertzel(ref, 4400);
+        /* a slot with a source but amount 0, or an amount but source OFF, does nothing */
+        set(e, "Mod 1 Source", SRC_LFO); set(e, "Mod 1 Dest", DST_P1);
+        double n1 = goertzel(run(e, 1.0), 440);
+        set(e, "Mod 1 Source", 0); set(e, "Mod 1 Amount", 100);
+        double n2 = goertzel(run(e, 1.0), 440);
+        CHECK(std::fabs(n1 / c0 - 1) < 0.01 && std::fabs(n2 / c0 - 1) < 0.01, "an empty slot changes the sound");
+        /* control rate: mod wheel closes the filter (negative amount = the inverter) */
+        set(e, "Mod 1 Source", SRC_WHEEL); set(e, "Mod 1 Dest", DST_CUTOFF); set(e, "Mod 1 Amount", -100);
+        double w0 = goertzel(run(e, 0.6), 4400); send(e, 0xb0, 1, 127); double w1 = goertzel(run(e, 0.6), 4400); send(e, 0xb0, 1, 0);
+        std::printf("  matrix: mod wheel -> cutoff -100 %%: 10th harmonic %.1f dB -> %.1f dB\n", db(w0 / h0), db(w1 / h0));
+        CHECK(w0 > 0.9 * h0 && w1 < 0.05 * h0, "mod wheel -> cutoff wrong");
+        /* aftertouch opens the VCA further / LFO pans */
+        set(e, "Mod 1 Source", SRC_AT); set(e, "Mod 1 Dest", DST_VCA); set(e, "Mod 1 Amount", -100);
+        send(e, 0xd0, 127, 0); double at = rms(run(e, 0.5), 0.3); send(e, 0xd0, 0, 0);
+        std::printf("  matrix: aftertouch -> VCA -100 %%: %.6f\n", at);
+        CHECK(at < 1e-4, "aftertouch -> VCA wrong");
+        set(e, "Mod 1 Source", SRC_LFO); set(e, "Mod 1 Dest", DST_PAN); set(e, "Mod 1 Amount", 100); set(e, "LFO Shape", 2); set(e, "LFO Rate", 43);   /* square, ~1 Hz */
+        Buf R; auto L = run(e, 3.0, &R); double lmax = 0, rmax = 0, both = 0;
+        for (size_t i = 0; i + 2205 < L.size(); i += 2205) { double l = 0, r = 0; for (int j = 0; j < 2205; j++) { l += std::fabs(L[i + j]); r += std::fabs(R[i + j]); } lmax = std::max(lmax, l / (l + r + 1e-9)); rmax = std::max(rmax, r / (l + r + 1e-9)); both += 0; }
+        std::printf("  matrix: LFO square -> pan: left share up to %.2f, right share up to %.2f\n", lmax, rmax);
+        CHECK(lmax > 0.95 && rmax > 0.95, "LFO -> pan wrong");
+        /* ADSR -> pitch, negative: the note starts low and rises to pitch */
+        set(e, "Mod 1 Source", SRC_ADSR); set(e, "Mod 1 Dest", DST_P1); set(e, "Mod 1 Amount", -50);   /* -1 octave at ADSR = 1 */
+        off(e, 69); run(e, 0.3); on(e, 69); double fa = freq(run(e, 1.0), 220);
+        std::printf("  matrix: ADSR -> VCO 1 pitch -50 %%: %.1f Hz\n", fa);
+        CHECK(std::fabs(cents(fa, 220)) < 10, "ADSR -> pitch wrong");
+        /* audio rate: VCO 3 pulse -> VCO 1 pitch (cross modulation) and -> cutoff */
+        set(e, "Mod 1 Source", SRC_VCO3); set(e, "Mod 1 Dest", DST_P1); set(e, "Mod 1 Amount", 20); set(e, "VCO3 Coarse", 67);   /* +-0.16 octaves */
+        auto xa = run(e, 1.0); double x1 = goertzel(xa, 440), f50 = freq(xa, 440);
+        /* at pulse width 20 % the pulse is negative on average (-0.6): VCO 1 sits 0.096 octaves lower */
+        set(e, "VCO3 Pulse Width", 20); run(e, 0.2); double f20 = freq(run(e, 1.0), 440 * std::pow(2.0, -0.096));
+        std::printf("  matrix: VCO 3 pulse -> VCO 1 pitch: 440 Hz line %.1f dB; centre %+.0f ct, at pulse width 20 %% %+.0f ct\n", db(x1 / c0), cents(f50, 440), cents(f20, 440));
+        CHECK(x1 < 0.8 * c0 && std::fabs(cents(f50, 440)) < 40 && std::fabs(cents(f20, 440) + 115) < 40, "cross modulation or VCO 3 pulse width wrong");
+        set(e, "Mod 1 Amount", 50);
+        set(e, "Mod 1 Dest", DST_CUTOFF); set(e, "Cutoff", 60);
+        auto fm = run(e, 1.0); set(e, "Mod 1 Amount", 0); auto nf = run(e, 1.0);
+        double sbm = goertzel(fm, 440 + 659.26), sbn = goertzel(nf, 440 + 659.26);
+        std::printf("  matrix: VCO 3 -> cutoff: sideband at 1099 Hz %.1f dBFS (without %.1f dBFS)\n", db(sbm), db(sbn));
+        CHECK(sbm > 5 * sbn && sbm > 1e-3, "audio-rate filter FM wrong");
         off(e, 69);
     }
 

@@ -1,9 +1,10 @@
 /* =============================================================================
  * carp_vst.cpp - carp 2000: a semi-modular synthesizer in the manner of the ARP 2600 as a VST2
- * instrument for the MPC OS plugin host (Force, MPC Live/One/X/Key), armhf. Phase 1 of the
- * README's roadmap: the monophonic base voice (carp_core.h) - 3 VCOs, filter mixer, VCF, ADSR/AR,
- * VCA. This file is the plug-in around it: parameters, MIDI (sample-accurate, last-note
- * priority, single/multiple trigger, pitch bend +-2), project chunk.
+ * instrument for the MPC OS plugin host (Force, MPC Live/One/X/Key), armhf. Phases 1 + 2 of the
+ * README's roadmap: the monophonic voice (carp_core.h) - 3 VCOs, ring modulator, noise, filter
+ * mixer, VCF, ADSR/AR, VCA, LFO, S&H, modulation matrix. This file is the plug-in around it:
+ * parameters, MIDI (sample-accurate, last-note priority, single/multiple trigger, pitch bend
+ * +-2, mod wheel, aftertouch), project chunk.
  * MIT license (see ../LICENSE). "ARP" and "2600" are trademarks of their owners; no affiliation.
  * ========================================================================== */
 #include <algorithm>
@@ -72,7 +73,12 @@ enum {
     MIX_V1SQ, MIX_V2PULSE, MIX_V3SAW, MIX_NOISE, MIX_V1SAW, MIX_V2TRI,
     CUTOFF, RESO, F_KBD, F_ADSR, F_FM_VCO2, DRIVE, F_TYPE, F_VEL,
     ATTACK, DECAY, SUSTAIN, RELEASE, AR_ATTACK, AR_RELEASE, TRIG,
-    VCA_GAIN, VCA_AR, VCA_ADSR, PAN, VOLUME, NKEYS
+    VCA_GAIN, VCA_AR, VCA_ADSR, PAN, VOLUME,
+    /* phase 2, appended */
+    V1_FM_SH, V2_FM_SH, V3_PW, MIX_RING, NOISE_COLOR, REPEAT, VCA_RING,
+    LFO_RATE, LFO_SHAPE, VIB_DEPTH, VIB_DELAY, SH_RATE, SH_SOURCE, SH_LAG,
+    M1_SRC, M1_DST, M1_AMT, M2_SRC, M2_DST, M2_AMT, M3_SRC, M3_DST, M3_AMT,
+    M4_SRC, M4_DST, M4_AMT, M5_SRC, M5_DST, M5_AMT, M6_SRC, M6_DST, M6_AMT, NKEYS
 };
 static const char *const KEYS[NKEYS] = {
     "v1_coarse", "v1_fine", "v1_lf", "v1_fm_adsr", "v1_fm_vco2", "v1_kbd", "porta",
@@ -82,6 +88,10 @@ static const char *const KEYS[NKEYS] = {
     "cutoff", "reso", "f_kbd", "f_adsr", "f_fm_vco2", "drive", "f_type", "f_vel",
     "attack", "decay", "sustain", "release", "ar_attack", "ar_release", "trig",
     "vca_gain", "vca_ar", "vca_adsr", "pan", "volume",
+    "v1_fm_sh", "v2_fm_sh", "v3_pw", "mix_ring", "noise_color", "repeat", "vca_ring",
+    "lfo_rate", "lfo_shape", "vib_depth", "vib_delay", "sh_rate", "sh_source", "sh_lag",
+    "m1_src", "m1_dst", "m1_amt", "m2_src", "m2_dst", "m2_amt", "m3_src", "m3_dst", "m3_amt",
+    "m4_src", "m4_dst", "m4_amt", "m5_src", "m5_dst", "m5_amt", "m6_src", "m6_dst", "m6_amt",
 };
 static int IDX[NKEYS];
 static int KEY_OF[NPARAMS];   /* PARAMS[] position -> key enum, -1 = not ours */
@@ -159,6 +169,8 @@ static float sq(float x) { return x * x; }
 static float law_semis(Plugin *w, int coarse, int fine) { return std::round(val(w, coarse)) + pct(w, fine); }
 static float law_time(float x, float lo, float ratio) { return lo * std::pow(ratio, x); }
 static float law_cutoff_oct(float x) { return x * 9.9657843f; }          /* 10 Hz .. 10 kHz */
+static float law_lfo_hz(float x) { return 0.05f * std::pow(1000.0f, x); }   /* 0.05 .. 50 Hz */
+static float law_sh_hz(float x) { return 0.1f * std::pow(1000.0f, x); }     /* 0.1 .. 100 Hz */
 static float vco_hz(float semis, bool lf) { return 440.0f * std::pow(2.0f, (semis - 69) / 12) * (lf ? 0.003f : 1.0f); }
 
 static void configure(Plugin *w) {
@@ -174,10 +186,12 @@ static void configure(Plugin *w) {
     }
     p.kbd[0] = sw(w, V1_KBD); p.kbd[1] = true; p.kbd[2] = sw(w, V3_KBD);
     p.fm_noise3 = 3 * sq(pct(w, V3_FM_NOISE));
+    p.fm_sh[0] = 3 * sq(pct(w, V1_FM_SH)); p.fm_sh[1] = 3 * sq(pct(w, V2_FM_SH)); p.fm_sh[2] = 0;
+    p.pw3 = pct(w, V3_PW);
     p.pw2 = pct(w, V2_PW);
     p.pwm_noise2 = pct(w, V2_PWM_NOISE);
     p.porta = 3 * sq(pct(w, PORTA));
-    static const int M[carp::NMIX] = {MIX_V1SQ, MIX_V2PULSE, MIX_V3SAW, MIX_NOISE, MIX_V1SAW, MIX_V2TRI};
+    static const int M[carp::NMIX] = {MIX_V1SQ, MIX_V2PULSE, MIX_V3SAW, MIX_NOISE, MIX_V1SAW, MIX_V2TRI, MIX_RING};
     for (int j = 0; j < carp::NMIX; j++) p.lvl[j] = pct(w, M[j]);
     p.cutoff = law_cutoff_oct(pct(w, CUTOFF));
     p.reso = pct(w, RESO);
@@ -198,6 +212,21 @@ static void configure(Plugin *w) {
     p.vca_adsr = pct(w, VCA_ADSR);
     p.pan = carp::clampf(val(w, PAN) / 50.0f, -1, 1);
     p.volume = sq(pct(w, VOLUME));
+    p.noise_color = pct(w, NOISE_COLOR);
+    p.repeat = clampi((int)val(w, REPEAT), 0, 2);
+    p.vca_ring = pct(w, VCA_RING);
+    p.lfo_rate = law_lfo_hz(pct(w, LFO_RATE));
+    p.lfo_shape = clampi((int)val(w, LFO_SHAPE), 0, 2);
+    p.vib = 2 * sq(pct(w, VIB_DEPTH));
+    p.vib_delay = 3 * sq(pct(w, VIB_DELAY));
+    p.sh_rate = law_sh_hz(pct(w, SH_RATE));
+    p.sh_src = clampi((int)val(w, SH_SOURCE), 0, 2);
+    p.sh_lag = sq(pct(w, SH_LAG));
+    for (int i = 0; i < carp::NSLOTS; i++) {
+        p.slot[i].src = clampi((int)val(w, M1_SRC + 3 * i), 0, carp::NSRC - 1);
+        p.slot[i].dst = clampi((int)val(w, M1_DST + 3 * i), 0, carp::NDST - 1);
+        p.slot[i].amt = carp::clampf(val(w, M1_AMT + 3 * i) / 100.0f, -1, 1);
+    }
     w->multi = sw(w, TRIG);
     w->voice.set_patch(p);
 }
@@ -225,6 +254,10 @@ static void midi(Plugin *w, const uint8_t *d) {
         else if (top) w->voice.note_on(w->held[k - 1], 1.0f, false);   /* back to the key still held */
     } else if (st == 0xe0) {
         w->voice.set_bend(((((int)d[2] & 0x7f) << 7 | (d[1] & 0x7f)) - 8192) * (2.0f / 8192.0f));
+    } else if (st == 0xd0) {
+        w->voice.set_aftertouch(n / 127.0f);
+    } else if (st == 0xb0 && n == 1) {
+        w->voice.set_wheel((d[2] & 0x7f) / 127.0f);
     } else if (st == 0xb0 && (n == 120 || n == 123)) {
         all_off(w);
     }
@@ -247,7 +280,7 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
         for (int c = 0; c < 2; c++) {
             float *y = out[c];
             for (int i = 0; i < n; i++) {
-                const float a = std::fabs(y[i]);              /* output safety above -3 dBFS */
+                const float a = std::fabs(y[i]);              /* output safety above -3 dBFS, ceiling 0.98 */
                 if (a > 0.7f) {
                     float t = std::min((a - 0.7f) / 0.3f, 3.0f), t2 = t * t;
                     y[i] = std::copysign(0.7f + 0.28f * t * (27 + t2) / (27 + 9 * t2), y[i]);
@@ -365,6 +398,11 @@ static void display(Plugin *w, int idx, char *buf, size_t n) {
     case CUTOFF: fmt_hz(buf, n, 10 * std::pow(2.0f, law_cutoff_oct(x))); break;
     case ATTACK: case AR_ATTACK: fmt_time(buf, n, law_time(x, 0.001f, 5000)); break;
     case DECAY: case RELEASE: case AR_RELEASE: fmt_time(buf, n, law_time(x, 0.005f, 2000)); break;
+    case VIB_DELAY: fmt_time(buf, n, 3 * sq(x)); break;
+    case SH_LAG: fmt_time(buf, n, sq(x)); break;
+    case LFO_RATE: fmt_hz(buf, n, law_lfo_hz(x)); break;
+    case SH_RATE: fmt_hz(buf, n, law_sh_hz(x)); break;
+    case M1_AMT: case M2_AMT: case M3_AMT: case M4_AMT: case M5_AMT: case M6_AMT: std::snprintf(buf, n, "%+d %%", u); break;
     case PAN: if (u == 0) std::snprintf(buf, n, "C"); else std::snprintf(buf, n, "%c%d", u < 0 ? 'L' : 'R', std::abs(u)); break;
     default: std::snprintf(buf, n, "%d %%", u); break;
     }
@@ -420,6 +458,11 @@ static void start_values(Plugin *w) {
     start(w, DRIVE, 25); start(w, F_TYPE, 0); start(w, F_VEL, 0);
     start(w, ATTACK, 0); start(w, DECAY, 55); start(w, SUSTAIN, 60); start(w, RELEASE, 40);
     start(w, AR_ATTACK, 0); start(w, AR_RELEASE, 40); start(w, TRIG, 0);
+    start(w, V1_FM_SH, 0); start(w, V2_FM_SH, 0); start(w, V3_PW, 50); start(w, MIX_RING, 0); start(w, NOISE_COLOR, 0);
+    start(w, REPEAT, 0); start(w, VCA_RING, 0);
+    start(w, LFO_RATE, 67); start(w, LFO_SHAPE, 0); start(w, VIB_DEPTH, 0); start(w, VIB_DELAY, 0);
+    start(w, SH_RATE, 63); start(w, SH_SOURCE, 0); start(w, SH_LAG, 0);
+    for (int i = 0; i < carp::NSLOTS; i++) { start(w, M1_SRC + 3 * i, 0); start(w, M1_DST + 3 * i, carp::DST_CUTOFF); start(w, M1_AMT + 3 * i, 0); }
     start(w, VCA_GAIN, 0); start(w, VCA_AR, 0); start(w, VCA_ADSR, 100); start(w, PAN, 0); start(w, VOLUME, 80);
 }
 
