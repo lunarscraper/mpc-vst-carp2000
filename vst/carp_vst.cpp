@@ -250,7 +250,7 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
                 const float a = std::fabs(y[i]);              /* output safety above -3 dBFS */
                 if (a > 0.7f) {
                     float t = std::min((a - 0.7f) / 0.3f, 3.0f), t2 = t * t;
-                    y[i] = std::copysign(0.7f + 0.3f * t * (27 + t2) / (27 + 9 * t2), y[i]);
+                    y[i] = std::copysign(0.7f + 0.28f * t * (27 + t2) / (27 + 9 * t2), y[i]);
                 }
             }
         }
