@@ -26,5 +26,5 @@ jobs:
       host_test: bash vst/test.sh
       plugin_id: carp2000
       license: MIT
-      about: Semi-modular synthesizer in the manner of the ARP 2600 - phase 1, the monophonic base voice (3 VCOs, filter mixer, ladder filter, ADSR/AR, VCA).
+      about: Semi-modular synthesizer in the manner of the ARP 2600 - phases 1 + 2, monophonic (3 VCOs, ring modulator, noise, ladder filter, ADSR/AR, LFO, S&H, 6-slot modulation matrix).
       dry_run: ${{ inputs.dry_run }}
