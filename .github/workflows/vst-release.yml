@@ -26,5 +26,5 @@ jobs:
       host_test: bash vst/test.sh
       plugin_id: carp2000
       license: MIT
-      about: Semi-modular synthesizer in the manner of the ARP 2600 - 3 VCOs, ring modulator, noise, ladder filter, ADSR/AR, LFO, S&H, 6-slot modulation matrix, spring reverb; mono, duophonic or 4 voices; 13 presets.
+      about: Semi-modular synthesizer in the manner of the ARP 2600 - 3 VCOs, ring modulator, noise, ladder filter, ADSR/AR, LFO, S&H, 6-slot modulation matrix, spring reverb; mono, duophonic or 4 voices; 32 preset slots.
       dry_run: ${{ inputs.dry_run }}
