@@ -3,7 +3,8 @@
  * 4072 ceiling), ADSR/AR/VCA (sustain, release, initial gain), mono key handling (last note,
  * single/multiple trigger), LF mode, cross FM, pan, ring modulator, noise colour, LFO vibrato
  * with delay, S&H, REPEAT, the modulation matrix at control and audio rate, the spring reverb,
- * duophonic and four-voice modes, every preset, output ceiling,
+ * duophonic and four-voice modes, every factory preset, the preset slots (browse, LOAD, SAVE,
+ * the shared file, programs, project chunk), output ceiling,
  * chunk restore, a random parameter/MIDI stress run, NaN/denormal-free output.
  * With "bench" as the second argument it only measures CPU load. Prints PASSED/FAILED. */
 #include <chrono>
@@ -65,7 +66,8 @@ static void set(AEffect *e, const char *name, double v) {
     else if (ends("Source") && s != "S&H Source") { hi = 12; }
     else if (ends("Dest")) { hi = 11; }
     else if (s == "LFO Shape" || s == "S&H Source" || s == "Repeat" || s == "Voice Mode") { hi = 2; }
-    else if (s == "Preset") { hi = NPRESETS - 1; }
+    else if (s == "Preset") { lo = 1; hi = 32; }
+    else if (s == "Preset Load" || s == "Preset Save") { hi = 1; }
     else if (ends(" LF") || (ends("Keyboard") && s != "VCF Keyboard") || s == "VCF Type" || s == "Trigger") { hi = 1; }
     e->setParameter(e, param(e, name), (float)((v - lo) / (hi - lo)));
 }
@@ -135,6 +137,8 @@ static void plain(AEffect *e) {
 }
 
 int main(int argc, char **argv) {
+    setenv("CARP2000_PRESETS", "/tmp/carp2000_presets_test.txt", 1);
+    std::remove("/tmp/carp2000_presets_test.txt");
     void *h = dlopen(argc > 1 ? argv[1] : "./carp2000.so", RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::printf("FAILED: dlopen %s\n", dlerror()); return 1; }
     auto mainf = (AEffect * (*)(audioMasterCallback)) dlsym(h, "VSTPluginMain");
@@ -460,30 +464,81 @@ int main(int argc, char **argv) {
         set(e, "Voice Mode", 0); run(e, 0.1);
     }
 
-    /* P3.4 presets: each one sounds and stays in range; INIT restores the start patch; a chunk keeps edits */
+    /* P3.4 factory presets: each one sounds and stays in range; slot 1 restores the start patch */
     {
+        auto pick = [&](AEffect *x, int slot) { x->setParameter(x, param(x, "Preset"), (float)(slot - 1) / 31.0f); };
+        auto press = [&](AEffect *x, const char *button) {      /* a press; the next audio block releases it */
+            x->setParameter(x, param(x, button), 1.0f);
+            Buf l(BS), r(BS); float *out[2] = {l.data(), r.data()};
+            x->processReplacing(x, nullptr, out, BS);
+        };
         AEffect *fresh = mainf(master);
         fresh->dispatcher(fresh, 10, 0, 0, nullptr, SR);
-        for (int k = 1; k < NPRESETS; k++) {
-            set(e, "Preset", k);
+        CHECK(e->numPrograms == 32, "numPrograms %d", (int)e->numPrograms);
+        for (int k = 2; k <= NPRESETS; k++) {
+            pick(e, k); press(e, "Preset Load");
             std::string name = display(e, "Preset");
             on(e, 48); run(e, 0.02); on(e, 55); auto a = run(e, 1.5); off(e, 55); off(e, 48); auto tl = run(e, 2.0);
             send(e, 0xb0, 123, 0);
-            std::printf("  preset %-12s first 150 ms %6.1f dBFS, 1.5 s %6.1f dBFS, peak %.3f, 1-2 s after release %6.1f dBFS\n", name.c_str(), db(rms(a, 0, 0.15)), db(rms(a, 0)), peak(a), db(rms(tl, 1.0)));
+            std::printf("  preset %-15s first 150 ms %6.1f dBFS, 1.5 s %6.1f dBFS, peak %.3f, 1-2 s after release %6.1f dBFS\n", name.c_str(), db(rms(a, 0, 0.15)), db(rms(a, 0)), peak(a), db(rms(tl, 1.0)));
             CHECK(rms(a, 0) > 3e-3 && peak(a) <= 0.981, "preset %s silent or too hot", name.c_str());
+            CHECK(e->getParameter(e, param(e, "Preset Load")) == 0, "LOAD does not read released");
         }
-        set(e, "Preset", 1); set(e, "Cutoff", 77);
+        pick(e, 1); press(e, "Preset Load");
+        int diff = 0; char b1[64], b2[64];
+        for (int i = 0; i < e->numParams; i++) { b1[0] = b2[0] = 0; e->dispatcher(e, 7, i, 0, b1, 0); fresh->dispatcher(fresh, 7, i, 0, b2, 0); if (std::strcmp(b1, b2)) diff++; }
+        CHECK(diff == 0, "INIT differs from the start patch in %d parameters", diff);
+        run(e, 12.0);
+
+        /* P3.5 slots: browsing changes nothing; SAVE and LOAD; an empty slot loads nothing; the file; programs */
+        std::string c0 = display(e, "Cutoff");
+        pick(e, 2);
+        CHECK(display(e, "Cutoff") == c0 && display(e, "Preset") == "02 BASS", "browsing loads (%s)", display(e, "Preset").c_str());
+        pick(e, 20);
+        CHECK(display(e, "Preset") == "20 (empty)", "empty slot shows %s", display(e, "Preset").c_str());
+        press(e, "Preset Load");
+        CHECK(display(e, "Cutoff") == c0, "loading an empty slot changes the sound");
+        set(e, "Cutoff", 33); set(e, "Voice Mode", 2); set(e, "Mod 3 Source", 8); set(e, "Mod 3 Amount", -42);
+        std::string c1 = display(e, "Cutoff");
+        press(e, "Preset Save");
+        CHECK(display(e, "Preset") == "20 USER", "SAVE: slot shows %s", display(e, "Preset").c_str());
+        set(e, "Cutoff", 90); set(e, "Voice Mode", 0); set(e, "Mod 3 Amount", 0);
+        press(e, "Preset Load");
+        CHECK(display(e, "Cutoff") == c1 && display(e, "Voice Mode") == "POLY 4" && display(e, "Mod 3 Amount") == "-42 %" && display(e, "Mod 3 Source") == "LFO", "LOAD does not bring the saved slot back");
+        /* a held button fires once: a second "down" without a release in between does nothing */
+        set(e, "Cutoff", 90);
+        e->setParameter(e, param(e, "Preset Load"), 1.0f); set(e, "Cutoff", 80); std::string c80 = display(e, "Cutoff");
+        e->setParameter(e, param(e, "Preset Load"), 1.0f);
+        CHECK(display(e, "Cutoff") == c80, "a held LOAD fires twice");
+        run(e, 0.05);
+        /* the file has the slot; as a program in another instance: name, effSetProgram, rename */
+        { FILE *f = std::fopen("/tmp/carp2000_presets_test.txt", "r"); char line[64] = {0}; if (f) { if (!std::fgets(line, sizeof line, f)) line[0] = 0; std::fclose(f); } CHECK(!std::strncmp(line, "20\t\tCARP1;", 10), "preset file line: %.20s", line); }
+        char nm[64] = {0};
+        fresh->dispatcher(fresh, 29, 19, 0, nm, 0);
+        fresh->dispatcher(fresh, 2, 0, 19, nullptr, 0);
+        CHECK(!std::strcmp(nm, "20 USER") && display(fresh, "Cutoff") == c1 && fresh->dispatcher(fresh, 3, 0, 0, nullptr, 0) == 19 && display(fresh, "Preset") == "20 USER", "program 20 (%s) not loaded in a second instance", nm);
+        fresh->dispatcher(fresh, 4, 0, 0, (void *)"My Pad", 0);
+        CHECK(display(e, "Preset") == "My Pad", "renamed slot shows %s", display(e, "Preset").c_str());
+        fresh->dispatcher(fresh, 2, 0, 1, nullptr, 0);
+        fresh->dispatcher(fresh, 5, 0, 0, nm, 0);
+        CHECK(!std::strcmp(nm, "02 BASS") && display(fresh, "VCO2 Coarse") == "-24 st", "program 2: %s, VCO 2 %s", nm, display(fresh, "VCO2 Coarse").c_str());
+        /* a factory slot can be overwritten, and the saved one wins */
+        set(fresh, "Cutoff", 12); std::string c2 = display(fresh, "Cutoff"); press(fresh, "Preset Save");
+        pick(e, 2); press(e, "Preset Load");
+        CHECK(display(e, "Cutoff") == c2, "a saved factory slot does not win");
+        std::printf("  slots: browse, SAVE, LOAD, file and programs ok (slot 20: cutoff %s, slot 2 overwritten: %s)\n", c1.c_str(), c2.c_str());
+        /* project chunk: keeps edits made after a preset and the selected slot, without loading the slot */
+        set(e, "Cutoff", 77);
         void *chunk = nullptr; intptr_t len = e->dispatcher(e, 23, 0, 0, &chunk, 0);
         std::vector<uint8_t> copy((uint8_t *)chunk, (uint8_t *)chunk + len);
         AEffect *e2 = mainf(master);
         e2->dispatcher(e2, 24, 0, (intptr_t)copy.size(), copy.data(), 0);
-        CHECK(display(e2, "Preset") == "BASS" && display(e2, "Cutoff") == display(e, "Cutoff") && display(e2, "VCO2 Coarse") == display(e, "VCO2 Coarse"), "chunk after a preset loses the edit");
+        CHECK(display(e2, "Preset") == "02 BASS" && display(e2, "Cutoff") == display(e, "Cutoff") && display(e2, "VCO2 Coarse") == display(e, "VCO2 Coarse"), "chunk after a preset loses the edit");
+        e2->dispatcher(e2, 2, 0, 2, nullptr, 0);
+        CHECK(display(e2, "Preset") == "03 LEAD" && display(e2, "Cutoff") != display(e, "Cutoff"), "picking another program after a chunk does not load it");
         e2->dispatcher(e2, 1, 0, 0, nullptr, 0);
-        set(e, "Preset", 0);
-        int diff = 0; char b1[64], b2[64];
-        for (int i = 0; i < e->numParams; i++) { b1[0] = b2[0] = 0; e->dispatcher(e, 7, i, 0, b1, 0); fresh->dispatcher(fresh, 7, i, 0, b2, 0); if (std::strcmp(b1, b2)) diff++; }
-        CHECK(diff == 0, "INIT differs from the start patch in %d parameters", diff);
         fresh->dispatcher(fresh, 1, 0, 0, nullptr, 0);
+        pick(e, 1); press(e, "Preset Load");
         run(e, 12.0);
     }
 
@@ -533,6 +588,7 @@ int main(int argc, char **argv) {
         CHECK(pk < 1.0, "stress run above 0 dBFS");
     }
 
+    std::remove("/tmp/carp2000_presets_test.txt");
     CHECK(!bad, "NaN, Inf or denormals in the output");
     e->dispatcher(e, 1, 0, 0, nullptr, 0);
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

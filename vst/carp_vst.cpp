@@ -1,7 +1,8 @@
 /* =============================================================================
  * carp_vst.cpp - carp 2000: a semi-modular synthesizer in the manner of the ARP 2600 as a VST2
  * instrument for the MPC OS plugin host (Force, MPC Live/One/X/Key), armhf. The voice and the spring
- * reverb are carp_core.h; this file is the plug-in around them: parameters, presets, the voice
+ * reverb are carp_core.h; this file is the plug-in around them: parameters, the 32 preset
+ * slots (browse / LOAD / SAVE, a file shared by all projects, also the plug-in's programs), the voice
  * modes (mono: newest key; duophonic: VCO 2 on the upper key; poly: four voices), MIDI
  * (sample-accurate, single/multiple trigger, pitch bend +-2, mod wheel, aftertouch), project chunk.
  * MIT license (see ../LICENSE). "ARP" and "2600" are trademarks of their owners; no affiliation.
@@ -49,7 +50,8 @@ typedef struct {
 typedef struct { int32_t numEvents; intptr_t reserved; VstEvent *events[2]; } VstEvents;
 
 enum {
-    effOpen = 0, effClose = 1, effGetParamLabel = 6, effGetParamDisplay = 7, effGetParamName = 8,
+    effOpen = 0, effClose = 1, effSetProgram = 2, effGetProgram = 3, effSetProgramName = 4, effGetProgramName = 5, effGetProgramNameIndexed = 29,
+    effGetParamLabel = 6, effGetParamDisplay = 7, effGetParamName = 8,
     effSetSampleRate = 10, effSetBlockSize = 11, effMainsChanged = 12, effGetChunk = 23,
     effSetChunk = 24, effProcessEvents = 25, effCanBeAutomated = 26, effGetPlugCategory = 35,
     effGetEffectName = 45, effGetVendorString = 47, effGetProductString = 48,
@@ -79,7 +81,7 @@ enum {
     M1_SRC, M1_DST, M1_AMT, M2_SRC, M2_DST, M2_AMT, M3_SRC, M3_DST, M3_AMT,
     M4_SRC, M4_DST, M4_AMT, M5_SRC, M5_DST, M5_AMT, M6_SRC, M6_DST, M6_AMT,
     /* phase 3, appended */
-    REV_MIX, REV_LEN, VOICE_MODE, PRESET, NKEYS
+    REV_MIX, REV_LEN, VOICE_MODE, PRESET, PRESET_LOAD, PRESET_SAVE, NKEYS
 };
 static const char *const KEYS[NKEYS] = {
     "v1_coarse", "v1_fine", "v1_lf", "v1_fm_adsr", "v1_fm_vco2", "v1_kbd", "porta",
@@ -93,13 +95,13 @@ static const char *const KEYS[NKEYS] = {
     "lfo_rate", "lfo_shape", "vib_depth", "vib_delay", "sh_rate", "sh_source", "sh_lag",
     "m1_src", "m1_dst", "m1_amt", "m2_src", "m2_dst", "m2_amt", "m3_src", "m3_dst", "m3_amt",
     "m4_src", "m4_dst", "m4_amt", "m5_src", "m5_dst", "m5_amt", "m6_src", "m6_dst", "m6_amt",
-    "rev_mix", "rev_len", "voice_mode", "preset",
+    "rev_mix", "rev_len", "voice_mode", "preset", "preset_load", "preset_save",
 };
 static int IDX[NKEYS];
 static int KEY_OF[NPARAMS];   /* PARAMS[] position -> key enum, -1 = not ours */
 
 enum { MODE_MONO, MODE_DUO, MODE_POLY };
-enum { NVOICES = 4, SEG = 1024 };
+enum { NVOICES = 4, SEG = 1024, NSLOTS = 32 };
 
 struct MidiEv { int32_t frame; uint8_t d[3]; };
 
@@ -110,6 +112,7 @@ struct Plugin {
     std::atomic<int> notify[NPARAMS];
     float open[NPARAMS] = {0};
     volatile int release[NPARAMS] = {0};
+    bool pressed[NPARAMS] = {false};   /* momentary params (LOAD, SAVE): the host currently reports them pressed */
     std::atomic<bool> dirty{true};
     carp::Voice voice[NVOICES];
     carp::Reverb reverb;
@@ -120,6 +123,7 @@ struct Plugin {
     int vnote[NVOICES] = {-1, -1, -1, -1};   /* poly: the key each voice plays, -1 = released */
     uint32_t vage[NVOICES] = {0, 0, 0, 0}, clock = 0;
     float send[SEG];
+    int cur = 0;                  /* selected preset slot, 0-based (the PRESET knob and the host's program) */
     MidiEv ev[256];
     int nev = 0;
     uint8_t held[32];             /* held keys, oldest first */
@@ -357,7 +361,7 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     }
     bool any = false;
     for (int i = 0; i < NPARAMS; i++) {
-        if (w->release[i]) { w->release[i] = 0; any = true; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
+        if (w->release[i]) { w->release[i] = 0; w->pressed[i] = false; any = true; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
         if (!w->notify[i].exchange(0)) continue;
         any = true;
         w->master(&w->fx, audioMasterAutomate, i, 0, 0, w->cache[i].load());
@@ -408,13 +412,104 @@ static const struct { const PV *pv; int n; } PRESETS[] = {
     {PRE_11, (int)(sizeof PRE_11 / sizeof(PV))},
     {PRE_12, (int)(sizeof PRE_12 / sizeof(PV))},
 };
+static const char *const FACTORY[] = {"INIT", "BASS", "LEAD", "KICK", "SNARE", "S&H BUBBLES", "RING BELL", "CROSS MOD", "WIND", "AUTO PULSE", "POLY PAD", "DUO LEAD", "LASER"};
+enum { NFACTORY = (int)(sizeof PRESETS / sizeof PRESETS[0]) };
+
+/* ---- preset slots (the mechanism of mpc-vst-acid) ---------------------------
+ * 32 slots shared by every instance and every project, kept in one text file on the SD card
+ * (one line per saved slot: "index<TAB>name<TAB>chunk"). A slot holds every control. Slots 1..13
+ * start as the factory presets and the rest empty; a saved slot wins over the factory one.
+ * The slots are also the plug-in's VST programs, so the host's PRESET list shows and selects
+ * them; the PRESET knob + LOAD/SAVE buttons do the same from the skin. */
+static std::mutex g_bank_lock;
+static bool g_bank_loaded;
+static std::string g_slot_chunk[NSLOTS], g_slot_name[NSLOTS], g_bank_path;
+
 static void start_values(Plugin *w);
-static void load_preset(Plugin *w, int n) {
-    if (n < 0 || n >= (int)(sizeof PRESETS / sizeof PRESETS[0])) return;
-    start_values(w);
-    for (int i = 0; i < PRESETS[n].n; i++) start(w, PRESETS[n].pv[i].key, PRESETS[n].pv[i].v);
-    start(w, PRESET, n);
+static std::string build_state(Plugin *w);
+static void apply_state(Plugin *w, const std::string &t, bool with_slot);
+
+/* Next to the plug-in's own folder rather than inside it, so reinstalling the folder doesn't take
+ * the presets with it; inside it if the parent can't be written. /proc/self/maps has the path. */
+static std::string so_dir() {
+    std::string dir;
+    if (FILE *f = std::fopen("/proc/self/maps", "r")) {
+        char line[1024];
+        while (std::fgets(line, sizeof line, f)) {
+            char *p = std::strstr(line, "/carp2000");
+            char *start = std::strchr(line, '/');
+            if (!p || !start || start > p || !std::strstr(p, ".so")) continue;
+            dir.assign(start, (size_t)(p - start));
+            break;
+        }
+        std::fclose(f);
+    }
+    return dir;
+}
+static void bank_load_locked() {
+    if (g_bank_loaded) return;
+    g_bank_loaded = true;
+    std::string dir = so_dir(), cand[2];
+    if (dir.empty()) dir = "/tmp";
+    size_t cut = dir.rfind('/');
+    cand[0] = (cut != std::string::npos && cut > 0 ? dir.substr(0, cut) : dir) + "/carp2000_presets.txt";
+    cand[1] = dir + "/carp2000_presets.txt";
+    if (const char *env = std::getenv("CARP2000_PRESETS")) cand[0] = cand[1] = env;   /* for the offline test */
+    g_bank_path.clear();
+    for (const std::string &c : cand)             /* an existing file wins ... */
+        if (FILE *f = std::fopen(c.c_str(), "r")) { std::fclose(f); g_bank_path = c; break; }
+    for (int i = 0; i < 2 && g_bank_path.empty(); i++)   /* ... else the first place we may write */
+        if (FILE *f = std::fopen(cand[i].c_str(), "a")) { std::fclose(f); g_bank_path = cand[i]; }
+    if (g_bank_path.empty()) return;
+    if (FILE *f = std::fopen(g_bank_path.c_str(), "r")) {
+        static char line[9000];
+        while (std::fgets(line, sizeof line, f)) {
+            line[std::strcspn(line, "\r\n")] = 0;
+            char *t1 = std::strchr(line, '\t');
+            char *t2 = t1 ? std::strchr(t1 + 1, '\t') : nullptr;
+            int idx = std::atoi(line);
+            if (!t2 || idx < 1 || idx > NSLOTS) continue;
+            *t1 = *t2 = 0;
+            g_slot_name[idx - 1] = t1 + 1;
+            g_slot_chunk[idx - 1] = t2 + 1;
+        }
+        std::fclose(f);
+    }
+}
+static bool bank_write_locked() {   /* whole file, via a temp file so a power cut can't leave half a bank */
+    if (g_bank_path.empty()) return false;
+    std::string tmp = g_bank_path + ".tmp";
+    FILE *f = std::fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    for (int i = 0; i < NSLOTS; i++)
+        if (!g_slot_chunk[i].empty())
+            std::fprintf(f, "%d\t%s\t%s\n", i + 1, g_slot_name[i].c_str(), g_slot_chunk[i].c_str());
+    return std::fclose(f) == 0 && std::rename(tmp.c_str(), g_bank_path.c_str()) == 0;
+}
+static std::string slot_title(int i) {
+    if (i < 0 || i >= NSLOTS) return "-";
+    std::lock_guard<std::mutex> lk(g_bank_lock);
+    char buf[32];
+    if (!g_slot_chunk[i].empty() && !g_slot_name[i].empty()) return g_slot_name[i];
+    if (i < NFACTORY) std::snprintf(buf, sizeof buf, "%02d %s", i + 1, FACTORY[i]);
+    else if (!g_slot_chunk[i].empty()) std::snprintf(buf, sizeof buf, "%02d USER", i + 1);
+    else std::snprintf(buf, sizeof buf, "%02d (empty)", i + 1);
+    return buf;
+}
+static void slot_load(Plugin *w) {
+    const int n = w->cur;
+    std::string c;
+    { std::lock_guard<std::mutex> lk(g_bank_lock); c = g_slot_chunk[n]; }
+    if (!c.empty()) { start_values(w); apply_state(w, c, false); }
+    else if (n < NFACTORY) { start_values(w); for (int i = 0; i < PRESETS[n].n; i++) start(w, PRESETS[n].pv[i].key, PRESETS[n].pv[i].v); }
+    else return;                                   /* an empty slot leaves the current state alone */
     w->dirty.store(true);
+}
+static void slot_save(Plugin *w) {
+    std::string c = build_state(w);
+    std::lock_guard<std::mutex> lk(g_bank_lock);
+    g_slot_chunk[w->cur] = c;
+    bank_write_locked();
 }
 
 static void setParameter(AEffect *e, int32_t i, float n) {
@@ -422,6 +517,22 @@ static void setParameter(AEffect *e, int32_t i, float n) {
     if (i < 0 || i >= NPARAMS) return;
     const param_t *p = &PARAMS[i];
     if (popup_set(w->open, i, n)) return;
+    if (KEY_OF[i] == PRESET) {   /* browsing only: LOAD loads, so turning the knob can't wipe what is playing */
+        const int v = (int)std::lround(clamp01(n) * (NSLOTS - 1));
+        if (v != w->cur) { w->cur = v; w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f); }
+        return;
+    }
+    if (KEY_OF[i] == PRESET_LOAD || KEY_OF[i] == PRESET_SAVE) {
+        const bool down = n > 0.5f;
+        const bool rising = down && !w->pressed[i];   /* an echo of our own automate must not re-fire */
+        w->pressed[i] = down;
+        if (rising) {
+            if (KEY_OF[i] == PRESET_LOAD) slot_load(w); else slot_save(w);
+            w->release[i] = 1;
+            w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f);
+        }
+        return;
+    }
     bool nudge = false;
     if (p->nopts > 1) {
         float pos = clamp01(n) * (p->nopts - 1);
@@ -431,32 +542,34 @@ static void setParameter(AEffect *e, int32_t i, float n) {
             nudge = true;
         }
     }
-    const int before = norm_to_ui(p, w->cache[i].load());
     w->cache[i].store(clamp01(n));
-    if (KEY_OF[i] == PRESET && norm_to_ui(p, clamp01(n)) != before) load_preset(w, norm_to_ui(p, clamp01(n)));
     w->dirty.store(true);
     if (!nudge) popup_picked(w->open, w->release, i);
 }
 static float getParameter(AEffect *e, int32_t i) {
     Plugin *w = (Plugin *)e->object;
     if (i < 0 || i >= NPARAMS) return 0.0f;
+    if (KEY_OF[i] == PRESET) return (float)w->cur / (NSLOTS - 1);
+    if (KEY_OF[i] == PRESET_LOAD || KEY_OF[i] == PRESET_SAVE) return 0.0f;   /* triggers always read released */
     if (popup_is(i)) return w->open[i];
     return w->cache[i].load();
 }
 
 /* project chunk: "CARP1;key=value;..." - by key, so parameters added in later phases keep
  * old projects loading (missing keys stay at their start values, unknown ones are skipped) */
-static intptr_t get_chunk(Plugin *w, void **ptr) {
+static bool not_stored(int i) { const int k = KEY_OF[i]; return k == PRESET || k == PRESET_LOAD || k == PRESET_SAVE || popup_is(i); }
+/* state as text: "CARP1;key=value;..." for every control - the project chunk and the preset slots */
+static std::string build_state(Plugin *w) {
     std::string t = "CARP1;";
     char buf[96];
-    for (int i = 0; i < NPARAMS; i++) { std::snprintf(buf, sizeof buf, "%s=%.3f;", PARAMS[i].key, (double)val_at(w, i)); t += buf; }
-    w->chunk.assign(t.begin(), t.end());
-    *ptr = w->chunk.data();
-    return (intptr_t)w->chunk.size();
+    for (int i = 0; i < NPARAMS; i++) {
+        if (not_stored(i)) continue;
+        std::snprintf(buf, sizeof buf, "%s=%.3f;", PARAMS[i].key, (double)val_at(w, i)); t += buf;
+    }
+    return t;
 }
-static intptr_t set_chunk(Plugin *w, const void *data, intptr_t len) {
-    std::string t((const char *)data, (size_t)len);
-    if (t.compare(0, 6, "CARP1;")) return 0;
+static void apply_state(Plugin *w, const std::string &t, bool with_slot) {
+    if (t.compare(0, 6, "CARP1;")) return;
     for (size_t pos = 6; pos < t.size();) {
         size_t semi = t.find(';', pos);
         if (semi == std::string::npos) break;
@@ -464,10 +577,27 @@ static intptr_t set_chunk(Plugin *w, const void *data, intptr_t len) {
         pos = semi + 1;
         size_t eq = kv.find('=');
         if (eq == std::string::npos) continue;
-        int i = param_index(kv.substr(0, eq).c_str());
-        if (i >= 0) set_val(w, i, std::atof(kv.c_str() + eq + 1));
+        const std::string key = kv.substr(0, eq);
+        if (key == "prog") {   /* which slot a project had selected; never loads the slot */
+            const int v = std::atoi(kv.c_str() + eq + 1);
+            if (with_slot && v >= 0 && v < NSLOTS) w->cur = v;
+            continue;
+        }
+        int i = param_index(key.c_str());
+        if (i >= 0 && !not_stored(i)) set_val(w, i, std::atof(kv.c_str() + eq + 1));
     }
     w->dirty.store(true);
+}
+static intptr_t get_chunk(Plugin *w, void **ptr) {
+    const std::string t = build_state(w) + "prog=" + std::to_string(w->cur) + ";";
+    w->chunk.assign(t.begin(), t.end());
+    *ptr = w->chunk.data();
+    return (intptr_t)w->chunk.size();
+}
+static intptr_t set_chunk(Plugin *w, const void *data, intptr_t len) {
+    std::string t((const char *)data, (size_t)len);
+    if (t.compare(0, 6, "CARP1;")) return 0;
+    apply_state(w, t, true);
     return 1;
 }
 
@@ -488,6 +618,8 @@ static void display(Plugin *w, int idx, char *buf, size_t n) {
         if (pp->nopts) std::snprintf(buf, n, "%s", pp->opts[u]); else std::snprintf(buf, n, "%d", u);
         return;
     }
+    if (KEY_OF[idx] == PRESET) { std::snprintf(buf, n, "%s", slot_title(w->cur).c_str()); return; }
+    if (KEY_OF[idx] == PRESET_LOAD || KEY_OF[idx] == PRESET_SAVE) { buf[0] = 0; return; }
     const int u = norm_to_ui(pp, w->cache[idx].load());
     if (pp->nopts) { std::snprintf(buf, n, "%s", pp->opts[u]); return; }
     const float x = (val_at(w, idx) - pp->min) / (pp->max > pp->min ? pp->max - pp->min : 1);
@@ -546,6 +678,28 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
     case effCanDo:
         if (p && (!std::strcmp((const char *)p, "receiveVstEvents") || !std::strcmp((const char *)p, "receiveVstMidiEvent"))) return 1;
         return -1;
+    case effSetProgram:
+        if (v >= 0 && v < NSLOTS) {
+            w->cur = (int)v;
+            slot_load(w);
+            w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f);
+        }
+        return 0;
+    case effGetProgram: return w->cur;
+    case effGetProgramName: copy_str(p, slot_title(w->cur).c_str(), 24); return 0;
+    case effGetProgramNameIndexed:
+        if (idx < 0 || idx >= NSLOTS) return 0;
+        copy_str(p, slot_title(idx).c_str(), 24);
+        return 1;
+    case effSetProgramName: {   /* only a saved slot has a line in the file to carry the name */
+        std::lock_guard<std::mutex> lk(g_bank_lock);
+        if (!p || g_slot_chunk[w->cur].empty()) return 0;
+        std::string nm((const char *)p);
+        for (char &c : nm) if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        g_slot_name[w->cur] = nm.substr(0, 23);
+        bank_write_locked();
+        return 0;
+    }
     case effGetChunk: return get_chunk(w, (void **)p);
     case effSetChunk: return set_chunk(w, p, v);
     default: return 0;
@@ -571,7 +725,7 @@ static void start_values(Plugin *w) {
     start(w, LFO_RATE, 67); start(w, LFO_SHAPE, 0); start(w, VIB_DEPTH, 0); start(w, VIB_DELAY, 0);
     start(w, SH_RATE, 63); start(w, SH_SOURCE, 0); start(w, SH_LAG, 0);
     for (int i = 0; i < carp::NSLOTS; i++) { start(w, M1_SRC + 3 * i, 0); start(w, M1_DST + 3 * i, carp::DST_CUTOFF); start(w, M1_AMT + 3 * i, 0); }
-    start(w, REV_MIX, 0); start(w, REV_LEN, 50); start(w, VOICE_MODE, 0); start(w, PRESET, 0);
+    start(w, REV_MIX, 0); start(w, REV_LEN, 50); start(w, VOICE_MODE, 0); 
     start(w, VCA_GAIN, 0); start(w, VCA_AR, 0); start(w, VCA_ADSR, 100); start(w, PAN, 0); start(w, VOLUME, 80);
 }
 
@@ -585,6 +739,7 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     w->master = master;
     for (int i = 0; i < NPARAMS; i++) { w->cache[i].store(PARAMS[i].def); w->notify[i].store(0); }
     start_values(w);
+    { std::lock_guard<std::mutex> lk(g_bank_lock); bank_load_locked(); }
     for (int v = 0; v < NVOICES; v++) w->voice[v].init(w->sr);
     w->reverb.init(w->sr);
     AEffect *e = &w->fx;
@@ -595,6 +750,7 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     e->getParameter = getParameter;
     e->processReplacing = processReplacing;
     e->numParams = NPARAMS;
+    e->numPrograms = NSLOTS;
     e->numInputs = 0;
     e->numOutputs = 2;
     e->flags = effFlagsCanReplacing | effFlagsProgramChunks | effFlagsIsSynth;

@@ -83,6 +83,8 @@
     {"key": "rev_mix", "name": "Reverb", "min": 0, "max": 100},
     {"key": "rev_len", "name": "Reverb Length", "min": 0, "max": 100},
     {"key": "voice_mode", "name": "Voice Mode", "options": ["MONO", "DUO", "POLY 4"]},
-    {"key": "preset", "name": "Preset", "options": ["INIT", "BASS", "LEAD", "KICK", "SNARE", "S&H BUBBLES", "RING BELL", "CROSS MOD", "WIND", "AUTO PULSE", "POLY PAD", "DUO LEAD", "LASER"]}
+    {"key": "preset", "name": "Preset", "min": 1, "max": 32},
+    {"key": "preset_load", "name": "Preset Load", "access": "write"},
+    {"key": "preset_save", "name": "Preset Save", "access": "write"}
   ]
 }

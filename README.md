@@ -207,7 +207,7 @@ Sechs Slots, je **Quelle**, **Ziel**, **Stärke** (−100 … +100 %). Die negat
 
 Code in `vst/`: `carp_core.h` (die Stimme), `carp_vst.cpp` (Plugin, MIDI, Projekt-Chunk), `host_test.cpp` (Offline-Test und Benchmark). Bauen über GitHub Actions („VST release (draft)") oder lokal mit `vst/build.sh`, danach `vst/test.sh`.
 
-Umgesetzt sind die Seiten 1 bis 8, die Matrix, der Federhall, die drei Stimmenmodi und 13 Presets (eigener Tab PRESET).
+Umgesetzt sind die Seiten 1 bis 8, die Matrix, der Federhall, die drei Stimmenmodi und 32 Preset-Plätze, davon 13 mit Werkspresets belegt (eigener Tab PRESET).
 
 Festlegungen, die das Konzept offen ließ:
 
@@ -225,7 +225,7 @@ Festlegungen, die das Konzept offen ließ:
 - **Duophon:** wie bei der 3620-Tastatur. Die tiefste gehaltene Taste spielt VCO 1, VCO 3 und das Filter-Tracking, die höchste VCO 2. Filter, Hüllkurven und VCA gibt es weiter nur einmal.
 - **Poly 4:** vier vollständige Stimmen, jede mit eigenem LFO und S&H. Die fünfte Taste übernimmt die älteste Stimme. Jede Taste löst neu aus, der Trigger-Schalter wirkt nur mono und duophon. Der Summenpegel ist um 3 dB abgesenkt. Initial Gain und Repeat AUTO wirken nur auf die erste Stimme, sonst klängen ohne Taste vier Stimmen.
 - **Federhall:** einmal pro Plugin. Zwei Federn (links/rechts), jede eine Verzögerung mit gedämpfter Rückkopplung und einer Kette gestreckter Allpässe für das typische Zwitschern. Hall-Anteil ist der Send hinter dem VCA, das Direktsignal bleibt unverändert. Länge 0,4 – 4 s.
-- **Presets** sind ein Parameter: Auswählen überschreibt alle Regler. Projekte speichern die Regler selbst, ein nach dem Laden verändertes Preset bleibt also erhalten. VST-Programme nutzt das Plugin nicht.
+- **Presets:** 32 Speicherplätze, gemeinsam für alle Instanzen und Projekte, technisch wie beim Acid-Plugin (`mpc-vst-acid`). Ein Platz enthält alle Regler. Tab PRESET: **PRESET** wählt einen Platz und blättert nur, **LOAD** lädt ihn (ein leerer Platz ändert nichts), **SAVE** überschreibt ihn mit dem aktuellen Stand. Die Plätze 1 – 13 sind mit den Werkspresets vorbelegt, 14 – 32 sind leer; ein gespeicherter Platz hat Vorrang vor dem Werkspreset. Die Plätze sind zugleich die Programme des Plugins: Die PRESET-Liste oben im Plugin-Fenster zeigt sie, eine Auswahl dort lädt sofort, und ein dort vergebener Name wird für gespeicherte Plätze übernommen. Gespeichert wird in `carp2000_presets.txt` neben dem Plugin-Ordner auf der SD-Karte (falls dort nicht schreibbar: im Ordner selbst). Diese Datei sichern heißt die Presets sichern, sie löschen stellt die Werkspresets wieder her. Projekte speichern alle Regler selbst und dazu, welcher Platz gewählt war.
 - Neue Parameter werden hinten angehängt. Projekte speichern nach Schlüssel und bleiben ladbar.
 
 CPU-Last im Offline-Benchmark auf einem x86-Kern: etwa 0,5 % für das Startpatch, 0,8 % im ungünstigsten Mono-Fall (alle Quellen, sechs Matrix-Slots in Audiorate) und 3,2 % für denselben Fall mit vier Stimmen und Hall.
