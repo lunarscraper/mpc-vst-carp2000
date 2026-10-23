@@ -4,7 +4,8 @@
  * single/multiple trigger), LF mode, cross FM, pan, ring modulator, noise colour, LFO vibrato
  * with delay, S&H, REPEAT, the modulation matrix at control and audio rate, the spring reverb,
  * duophonic and four-voice modes, every factory preset, the preset slots (browse, LOAD, SAVE,
- * the shared file, programs, project chunk), output ceiling,
+ * the shared file, programs, project chunk), RANDOM by style (always playable, the matrix in use,
+ * VARIATION, MODULATION, UNDO, what it must not touch, where its settings are kept), output ceiling,
  * chunk restore, a random parameter/MIDI stress run, NaN/denormal-free output.
  * With "bench" as the second argument it only measures CPU load. Prints PASSED/FAILED. */
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <string>
 #include <vector>
 #include <dlfcn.h>
+#include <unistd.h>
 
 struct AEffect;
 typedef intptr_t (*audioMasterCallback)(AEffect *, int32_t, int32_t, intptr_t, void *, float);
@@ -67,7 +69,8 @@ static void set(AEffect *e, const char *name, double v) {
     else if (ends("Dest")) { hi = 11; }
     else if (s == "LFO Shape" || s == "S&H Source" || s == "Repeat" || s == "Voice Mode") { hi = 2; }
     else if (s == "Preset") { lo = 1; hi = 32; }
-    else if (s == "Preset Load" || s == "Preset Save") { hi = 1; }
+    else if (s == "Preset Load" || s == "Preset Save" || s == "Random" || s == "Random Undo") { hi = 1; }
+    else if (s == "Random Style") { hi = 5; }
     else if (ends(" LF") || (ends("Keyboard") && s != "VCF Keyboard") || s == "VCF Type" || s == "Trigger") { hi = 1; }
     e->setParameter(e, param(e, name), (float)((v - lo) / (hi - lo)));
 }
@@ -137,8 +140,11 @@ static void plain(AEffect *e) {
 }
 
 int main(int argc, char **argv) {
-    setenv("CARP2000_PRESETS", "/tmp/carp2000_presets_test.txt", 1);
-    std::remove("/tmp/carp2000_presets_test.txt");
+    static char presets[64];
+    std::snprintf(presets, sizeof presets, "/tmp/carp2000_presets_test_%d.txt", (int)getpid());
+    setenv("CARP2000_PRESETS", presets, 1);
+    setenv("CARP2000_SEED", "2600", 0);   /* RANDOM repeatable; set it yourself to try other draws */
+    std::remove(presets);
     void *h = dlopen(argc > 1 ? argv[1] : "./carp2000.so", RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::printf("FAILED: dlopen %s\n", dlerror()); return 1; }
     auto mainf = (AEffect * (*)(audioMasterCallback)) dlsym(h, "VSTPluginMain");
@@ -512,7 +518,7 @@ int main(int argc, char **argv) {
         CHECK(display(e, "Cutoff") == c80, "a held LOAD fires twice");
         run(e, 0.05);
         /* the file has the slot; as a program in another instance: name, effSetProgram, rename */
-        { FILE *f = std::fopen("/tmp/carp2000_presets_test.txt", "r"); char line[64] = {0}; if (f) { if (!std::fgets(line, sizeof line, f)) line[0] = 0; std::fclose(f); } CHECK(!std::strncmp(line, "20\t\tCARP1;", 10), "preset file line: %.20s", line); }
+        { FILE *f = std::fopen(presets, "r"); char line[64] = {0}; if (f) { if (!std::fgets(line, sizeof line, f)) line[0] = 0; std::fclose(f); } CHECK(!std::strncmp(line, "20\t\tCARP1;", 10), "preset file line: %.20s", line); }
         char nm[64] = {0};
         fresh->dispatcher(fresh, 29, 19, 0, nm, 0);
         fresh->dispatcher(fresh, 2, 0, 19, nullptr, 0);
@@ -539,6 +545,94 @@ int main(int argc, char **argv) {
         e2->dispatcher(e2, 1, 0, 0, nullptr, 0);
         fresh->dispatcher(fresh, 1, 0, 0, nullptr, 0);
         pick(e, 1); press(e, "Preset Load");
+        run(e, 12.0);
+    }
+
+    /* R. RANDOM: every style always plays and stays in range; MODULATION fills the matrix; VARIATION;
+     *    UNDO swaps; volume, pan, voice mode and the slot stay; the settings live in the project only */
+    {
+        auto press = [&](const char *button) { e->setParameter(e, param(e, button), 1.0f); Buf l(BS), r(BS); float *out[2] = {l.data(), r.data()}; e->processReplacing(e, nullptr, out, BS); };
+        auto snapshot = [&]() { std::vector<std::string> v; char b[64]; for (int i = 0; i < e->numParams; i++) { b[0] = 0; e->dispatcher(e, 7, i, 0, b, 0); v.push_back(b); } return v; };
+        auto slots_used = [&]() { int n = 0; for (int i = 1; i <= 6; i++) { char b[32]; std::snprintf(b, sizeof b, "Mod %d Source", i); if (display(e, b) != "OFF") n++; } return n; };
+        auto ndiff = [](const std::vector<std::string> &a, const std::vector<std::string> &b) { int n = 0; for (size_t i = 0; i < a.size(); i++) if (a[i] != b[i]) n++; return n; };
+        auto raw = [&]() { std::vector<float> v; for (int i = 0; i < e->numParams; i++) v.push_back(e->getParameter(e, i)); return v; };
+        auto dist = [](const std::vector<float> &a, const std::vector<float> &b) { double d = 0; for (size_t i = 0; i < a.size(); i++) d += std::fabs(a[i] - b[i]); return d; };
+        CHECK(display(e, "Random Style") == "ANY" && display(e, "Random Variation") == "100 %" && display(e, "Random Modulation") == "50 %", "RANDOM defaults %s %s %s",
+              display(e, "Random Style").c_str(), display(e, "Random Variation").c_str(), display(e, "Random Modulation").c_str());
+        set(e, "Volume", 80); set(e, "Pan", 0); set(e, "Voice Mode", 0);
+        static const char *SN[6] = {"ANY", "BASS", "LEAD", "PAD", "PERC", "FX"};
+        double worst = 1, pkmax = 0; int quiet = 0;
+        for (int st = 0; st < 6; st++) {
+            set(e, "Random Style", st);
+            for (int m : {0, 50, 100}) {
+                set(e, "Random Modulation", m);
+                int used = 0, n = 0; double lo = 1, hi = 0, tl = 0;
+                for (int it = 0; it < 12; it++, n++) {
+                    press("Random");
+                    used += slots_used();
+                    if (m == 0) CHECK(slots_used() == 0 && display(e, "VCO1 FM VCO2") == "0 %" && display(e, "Repeat") == "OFF", "MODULATION 0 still modulates (%s)", SN[st]);
+                    CHECK(display(e, "Volume") == "80 %" && display(e, "Pan") == "C" && display(e, "Voice Mode") == "MONO" && display(e, "VCA Initial Gain") == "0 %", "RANDOM touched volume/pan/voices/gain");
+                    Buf ar;
+                    on(e, 48); auto a = run(e, 1.0, &ar); off(e, 48); auto t = run(e, 7.0);
+                    for (size_t j = 0; j < a.size(); j++) a[j] = 0.5f * (a[j] + ar[j]);   /* mono sum: auto-pan counts */
+                    const double r = std::max(std::max(rms(a, 0, 0.08), rms(a, 0, 0.25)), rms(a, 0.25));   /* a drum hit, a pluck, a slow pad */
+                    lo = std::min(lo, r); hi = std::max(hi, r); tl = std::max(tl, rms(t, 6.0));
+                    pkmax = std::max(pkmax, peak(a));
+                    if (r < 1e-2) { quiet++; if (std::getenv("DUMP")) { char b[64], nm[64]; for (int i = 0; i < e->numParams; i++) { b[0] = nm[0] = 0; e->dispatcher(e, 8, i, 0, nm, 0); e->dispatcher(e, 7, i, 0, b, 0); std::printf("    %s = %s\n", nm, b); } } std::printf("  quiet RANDOM %s mod %d: %.1f dBFS (cutoff %s, VCA ADSR %s AR %s, attack %s)\n", SN[st], m, db(r),
+                                                 display(e, "Cutoff").c_str(), display(e, "VCA ADSR").c_str(), display(e, "VCA AR").c_str(), display(e, "ADSR Attack").c_str()); }
+                    CHECK(peak(a) <= 0.981, "RANDOM %s too hot", SN[st]);
+                    if (rms(t, 6.0) > 1e-3) std::printf("  long tail %s mod %d: %.1f dBFS (release %s, reverb %s / %s, repeat %s)\n", SN[st], m, db(rms(t, 6.0)),
+                                                       display(e, "ADSR Release").c_str(), display(e, "Reverb").c_str(), display(e, "Reverb Length").c_str(), display(e, "Repeat").c_str());
+                    send(e, 0xb0, 123, 0);
+                }
+                std::printf("  random %-4s mod %3d: level %6.1f .. %5.1f dBFS, matrix slots %.1f on average, tail after 6 s %6.1f dBFS\n", SN[st], m, db(lo), db(hi), (double)used / n, db(tl));
+                if (m == 100) CHECK((double)used / n >= 2.5, "MODULATION 100 uses only %.1f slots (%s)", (double)used / n, SN[st]);
+                CHECK(tl < 1e-3, "RANDOM %s does not fall silent", SN[st]);
+                worst = std::min(worst, lo);
+            }
+        }
+        CHECK(quiet == 0, "%d random patches too quiet", quiet);
+        /* style shapes the result: BASS sits low, PAD attacks slowly, PERC has no sustain */
+        set(e, "Random Modulation", 50);
+        int low = 0, slow = 0, nosus = 0;
+        for (int it = 0; it < 20; it++) {
+            set(e, "Random Style", 1); press("Random"); low += display(e, "VCO1 Coarse")[0] == '-';
+            set(e, "Random Style", 3); press("Random"); slow += e->getParameter(e, param(e, "ADSR Attack")) >= 0.399f || display(e, "Repeat") != "OFF";   /* REPEAT keeps the attack short */
+            set(e, "Random Style", 4); press("Random"); nosus += display(e, "ADSR Sustain") == "0 %";
+        }
+        CHECK(low == 20 && slow == 20 && nosus == 20, "styles: BASS low %d/20, PAD slow %d/20, PERC no sustain %d/20", low, slow, nosus);
+        /* UNDO swaps the sound before the last RANDOM with the current one */
+        set(e, "Random Style", 0);
+        auto before = snapshot(); press("Random"); auto after = snapshot();
+        CHECK(ndiff(before, after) > 10, "RANDOM changes only %d parameters", ndiff(before, after));
+        press("Random Undo"); CHECK(ndiff(snapshot(), before) == 0, "UNDO does not restore (%d differ)", ndiff(snapshot(), before));
+        press("Random Undo"); CHECK(ndiff(snapshot(), after) == 0, "second UNDO does not redo (%d differ)", ndiff(snapshot(), after));
+        CHECK(e->getParameter(e, param(e, "Random")) == 0 && e->getParameter(e, param(e, "Random Undo")) == 0 && display(e, "Random").empty(), "RANDOM/UNDO do not read released");
+        /* VARIATION: 0 keeps the sound, small values change less than 100 */
+        set(e, "Random Variation", 0); before = snapshot(); press("Random");
+        CHECK(ndiff(before, snapshot()) == 0, "VARIATION 0 changes %d parameters", ndiff(before, snapshot()));
+        double d20 = 0, d100 = 0;
+        for (int it = 0; it < 20; it++) {
+            set(e, "Random Variation", 20); auto r0 = raw(); press("Random"); d20 += dist(r0, raw());
+            set(e, "Random Variation", 100); r0 = raw(); press("Random"); d100 += dist(r0, raw());
+        }
+        std::printf("  variation: 20 %% moves the controls by %.2f in all, 100 %% by %.2f; UNDO swaps; quietest %.1f dBFS, peak %.3f\n", d20 / 20, d100 / 20, db(worst), pkmax);
+        CHECK(d20 < 0.4 * d100, "VARIATION 20 changes nearly as much as 100 (%.1f vs %.1f)", d20, d100);
+        /* the settings: not in a preset slot, not reset by LOAD, kept in the project */
+        set(e, "Random Style", 5); set(e, "Random Variation", 35); set(e, "Random Modulation", 80);
+        e->setParameter(e, param(e, "Preset"), 21.0f / 31.0f); press("Preset Save");
+        { FILE *f = std::fopen(presets, "r"); std::string all; char line[9000]; if (f) { while (std::fgets(line, sizeof line, f)) all += line; std::fclose(f); }
+          CHECK(all.find("rnd_") == std::string::npos && all.find("\t\tCARP1;") != std::string::npos, "RANDOM settings saved into a preset slot"); }
+        e->setParameter(e, param(e, "Preset"), 1.0f / 31.0f); press("Preset Load");
+        CHECK(display(e, "Random Style") == "FX" && display(e, "Random Variation") == "35 %" && display(e, "Random Modulation") == "80 %", "LOAD resets the RANDOM settings");
+        void *chunk = nullptr; intptr_t len = e->dispatcher(e, 23, 0, 0, &chunk, 0);
+        std::vector<uint8_t> copy((uint8_t *)chunk, (uint8_t *)chunk + len);
+        AEffect *e2 = mainf(master);
+        e2->dispatcher(e2, 24, 0, (intptr_t)copy.size(), copy.data(), 0);
+        CHECK(display(e2, "Random Style") == "FX" && display(e2, "Random Variation") == "35 %" && display(e2, "Random Modulation") == "80 %", "project chunk loses the RANDOM settings");
+        e2->dispatcher(e2, 1, 0, 0, nullptr, 0);
+        set(e, "Random Style", 0); set(e, "Random Variation", 100); set(e, "Random Modulation", 50);
+        e->setParameter(e, param(e, "Preset"), 0.0f); press("Preset Load");
         run(e, 12.0);
     }
 
@@ -588,7 +682,7 @@ int main(int argc, char **argv) {
         CHECK(pk < 1.0, "stress run above 0 dBFS");
     }
 
-    std::remove("/tmp/carp2000_presets_test.txt");
+    std::remove(presets);
     CHECK(!bad, "NaN, Inf or denormals in the output");
     e->dispatcher(e, 1, 0, 0, nullptr, 0);
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

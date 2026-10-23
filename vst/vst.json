@@ -2,9 +2,9 @@
   "name": "carp 2000",
   "vendor": "lunarscraper",
   "uid": "Cp2k",
-  "version": 1000,
+  "version": 1100,
   "so": "carp2000.so",
   "module": "module.json",
   "layout": "layout.conf",
-  "_comment": "Instrument: semi-modular synth in the manner of the ARP 2600 (carp_core.h): mono, duophonic or 4 voices, modulation matrix, spring reverb, presets. vst.json/module.json only feed mpc-vst-plugins' tools/gen_vst.py for params.h + the skin. The plugin is carp_vst.cpp, built by this port's own build.sh."
+  "_comment": "Instrument: semi-modular synth in the manner of the ARP 2600 (carp_core.h): mono, duophonic or 4 voices, modulation matrix, spring reverb, presets, RANDOM. vst.json/module.json only feed mpc-vst-plugins' tools/gen_vst.py for params.h + the skin. The plugin is carp_vst.cpp, built by this port's own build.sh."
 }

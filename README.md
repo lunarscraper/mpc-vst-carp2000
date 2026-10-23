@@ -4,7 +4,7 @@ Repo: `mpc-vst-carp2000`
 
 Semi-modularer Synthesizer nach dem Vorbild des ARP 2600 als VST2-Plugin für Akai Force und MPC (Standalone), gebaut auf dem mpc-vst-plugins-Gerüst (DPF).
 
-**Status:** Alle drei Phasen des Fahrplans sind umgesetzt, siehe [Stand](#stand).
+**Status:** Alle drei Phasen des Fahrplans sind umgesetzt, dazu eine Zufallsfunktion (RANDOM), siehe [Stand](#stand).
 
 ## Idee
 
@@ -142,6 +142,19 @@ Wellenformen: Sägezahn, Puls.
 | 7 | S&H-Lag | Glättung |
 | 8 | Stimmenmodus | mono / duophon / poly 4 |
 
+### Seite PRESET – Speicherplätze und Zufall
+
+| Nr. | Parameter | Hinweis |
+|---|---|---|
+| 1 | Preset | Platz 1 – 32 wählen (blättert nur) |
+| 2 | LOAD | lädt den gewählten Platz |
+| 3 | SAVE | überschreibt ihn mit dem aktuellen Stand |
+| 4 | Style | ANY / BASS / LEAD / PAD / PERC / FX |
+| 5 | Variation | 100 % = ganz neuer Klang, weniger = Variation des aktuellen |
+| 6 | Modulation | wie viel Matrix, FM, S&H-FM und REPEAT der Zufall nutzt |
+| – | RANDOM | würfelt (nur Touchscreen) |
+| – | UNDO | holt den Klang vor dem letzten RANDOM zurück (nur Touchscreen) |
+
 ## Modulationsmatrix
 
 Sechs Slots, je **Quelle**, **Ziel**, **Stärke** (−100 … +100 %). Die negative Stärke ersetzt den Inverter des Originals.
@@ -207,7 +220,7 @@ Sechs Slots, je **Quelle**, **Ziel**, **Stärke** (−100 … +100 %). Die negat
 
 Code in `vst/`: `carp_core.h` (die Stimme), `carp_vst.cpp` (Plugin, MIDI, Projekt-Chunk), `host_test.cpp` (Offline-Test und Benchmark). Bauen über GitHub Actions („VST release (draft)") oder lokal mit `vst/build.sh`, danach `vst/test.sh`.
 
-Umgesetzt sind die Seiten 1 bis 8, die Matrix, der Federhall, die drei Stimmenmodi und 32 Preset-Plätze, davon 13 mit Werkspresets belegt (eigener Tab PRESET).
+Umgesetzt sind die Seiten 1 bis 8, die Matrix, der Federhall, die drei Stimmenmodi, 32 Preset-Plätze, davon 13 mit Werkspresets belegt, und RANDOM mit UNDO (beides im Tab PRESET).
 
 Festlegungen, die das Konzept offen ließ:
 
@@ -226,6 +239,16 @@ Festlegungen, die das Konzept offen ließ:
 - **Poly 4:** vier vollständige Stimmen, jede mit eigenem LFO und S&H. Die fünfte Taste übernimmt die älteste Stimme. Jede Taste löst neu aus, der Trigger-Schalter wirkt nur mono und duophon. Der Summenpegel ist um 3 dB abgesenkt. Initial Gain und Repeat AUTO wirken nur auf die erste Stimme, sonst klängen ohne Taste vier Stimmen.
 - **Federhall:** einmal pro Plugin. Zwei Federn (links/rechts), jede eine Verzögerung mit gedämpfter Rückkopplung und einer Kette gestreckter Allpässe für das typische Zwitschern. Hall-Anteil ist der Send hinter dem VCA, das Direktsignal bleibt unverändert. Länge 0,4 – 4 s.
 - **Presets:** 32 Speicherplätze, gemeinsam für alle Instanzen und Projekte, technisch wie beim Acid-Plugin (`mpc-vst-acid`). Ein Platz enthält alle Regler. Tab PRESET: **PRESET** wählt einen Platz und blättert nur, **LOAD** lädt ihn (ein leerer Platz ändert nichts), **SAVE** überschreibt ihn mit dem aktuellen Stand. Die Plätze 1 – 13 sind mit den Werkspresets vorbelegt, 14 – 32 sind leer; ein gespeicherter Platz hat Vorrang vor dem Werkspreset. Die Plätze sind zugleich die Programme des Plugins: Die PRESET-Liste oben im Plugin-Fenster zeigt sie, eine Auswahl dort lädt sofort, und ein dort vergebener Name wird für gespeicherte Plätze übernommen. Gespeichert wird in `carp2000_presets.txt` neben dem Plugin-Ordner auf der SD-Karte (falls dort nicht schreibbar: im Ordner selbst). Diese Datei sichern heißt die Presets sichern, sie löschen stellt die Werkspresets wieder her. Projekte speichern alle Regler selbst und dazu, welcher Platz gewählt war.
+- **RANDOM** (Version 1.1): würfelt einen spielbaren Patch, Matrix eingeschlossen.
+  - **STYLE** legt die Klangart fest: BASS (tief, kurz, Filterhüllkurve), LEAD (Portamento, Vibrato), PAD (langsamer Attack, Hall, langsame Modulation), PERC (keine Haltephase, Tonhöhen-Sweep, Rauschen, Ringmodulator), FX (LF-Modus, S&H, REPEAT, Kreuzmodulation). ANY wählt bei jedem Druck eine der fünf.
+  - **VARIATION** 100 % zieht einen ganz neuen Klang. Darunter wandert jeder Regler nur so weit Richtung Neuwurf, und Schalter, Tonhöhen-Raster und Matrix-Slots wechseln nur mit dieser Wahrscheinlichkeit. 10 – 30 % ergeben Varianten des aktuellen Klangs, 0 % ändert nichts.
+  - **MODULATION** steuert die Bewegung: 0 % keine Matrix, keine FM, kein REPEAT; 50 % etwa zwei Slots; 100 % vier bis sechs Slots mit größerer Tiefe.
+  - Die Matrix wird nicht wild verdrahtet, sondern aus 25 Patches gezogen, die auf diesem Instrument Sinn ergeben (LFO → Cutoff, LFO → Pulsbreite, S&H → Cutoff, Velocity / Modwheel / Aftertouch → Cutoff, Kreuzmodulation VCO 3 → VCO 1, Audio-FM aufs Filter, Auto-Pan, Hüllkurve → LFO-Rate …), je Stil gewichtet und nur dort, wo das Ziel hörbar ist (z. B. PWM nur, wenn der Puls von VCO 2 im Mixer ist). Jeder Patch höchstens einmal. Intervalle der VCOs kommen aus Listen pro Stil (Oktaven, Quinten; bei PERC und FX auch schräge Intervalle).
+  - Eine Schlussprüfung hält jedes Ergebnis spielbar: Ein VCO im LF-Modus liegt nie im Mixer, irgendetwas erreicht immer das Filter, der VCA öffnet, das Filter öffnet (auch gegen den Hub bipolarer Matrix-Quellen), Auto-Pan nie hart auf eine Seite, bei REPEAT ein kurzer Attack. Nichts geht per Matrix auf den VCA, weil er sonst ohne Taste offen stünde.
+  - Unangetastet bleiben Volume, Pan, Stimmenmodus und der gewählte Speicherplatz. Initial Gain bleibt 0: Kein Zufallsklang tönt ohne Taste.
+  - **UNDO** tauscht den Klang vor dem letzten RANDOM mit dem aktuellen; ein zweiter Druck stellt den Zufallsklang wieder her. Gefällt der Wurf: Platz wählen, SAVE.
+  - RANDOM und UNDO liegen bewusst nicht auf den Q-Links, damit ein Drehen nie den Klang wegwirft. STYLE, VARIATION und MODULATION gehören zum Projekt, nicht zu einem Preset: LOAD ändert sie nicht.
+  - Offline-Test: über 200 Zufallspatches pro Lauf (jeder Stil mit Modulation 0, 50 und 100) müssen hörbar sein, unter 0 dBFS bleiben und nach dem Loslassen verstummen; dazu Stil-Merkmale, VARIATION, UNDO und Speicherorte. `CARP2000_SEED` legt die Würfe fest.
 - Neue Parameter werden hinten angehängt. Projekte speichern nach Schlüssel und bleiben ladbar.
 
 CPU-Last im Offline-Benchmark auf einem x86-Kern: etwa 0,5 % für das Startpatch, 0,8 % im ungünstigsten Mono-Fall (alle Quellen, sechs Matrix-Slots in Audiorate) und 3,2 % für denselben Fall mit vier Stimmen und Hall.

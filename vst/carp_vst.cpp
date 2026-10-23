@@ -4,7 +4,8 @@
  * reverb are carp_core.h; this file is the plug-in around them: parameters, the 32 preset
  * slots (browse / LOAD / SAVE, a file shared by all projects, also the plug-in's programs), the voice
  * modes (mono: newest key; duophonic: VCO 2 on the upper key; poly: four voices), MIDI
- * (sample-accurate, single/multiple trigger, pitch bend +-2, mod wheel, aftertouch), project chunk.
+ * (sample-accurate, single/multiple trigger, pitch bend +-2, mod wheel, aftertouch), project chunk,
+ * and RANDOM: a new or varied patch by style, matrix included, with one step of UNDO.
  * MIT license (see ../LICENSE). "ARP" and "2600" are trademarks of their owners; no affiliation.
  * ========================================================================== */
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -81,7 +83,9 @@ enum {
     M1_SRC, M1_DST, M1_AMT, M2_SRC, M2_DST, M2_AMT, M3_SRC, M3_DST, M3_AMT,
     M4_SRC, M4_DST, M4_AMT, M5_SRC, M5_DST, M5_AMT, M6_SRC, M6_DST, M6_AMT,
     /* phase 3, appended */
-    REV_MIX, REV_LEN, VOICE_MODE, PRESET, PRESET_LOAD, PRESET_SAVE, NKEYS
+    REV_MIX, REV_LEN, VOICE_MODE, PRESET, PRESET_LOAD, PRESET_SAVE,
+    /* random patch, appended */
+    RND_STYLE, RND_VAR, RND_MOD, RND_GO, RND_UNDO, NKEYS
 };
 static const char *const KEYS[NKEYS] = {
     "v1_coarse", "v1_fine", "v1_lf", "v1_fm_adsr", "v1_fm_vco2", "v1_kbd", "porta",
@@ -96,6 +100,7 @@ static const char *const KEYS[NKEYS] = {
     "m1_src", "m1_dst", "m1_amt", "m2_src", "m2_dst", "m2_amt", "m3_src", "m3_dst", "m3_amt",
     "m4_src", "m4_dst", "m4_amt", "m5_src", "m5_dst", "m5_amt", "m6_src", "m6_dst", "m6_amt",
     "rev_mix", "rev_len", "voice_mode", "preset", "preset_load", "preset_save",
+    "rnd_style", "rnd_var", "rnd_mod", "rnd_go", "rnd_undo",
 };
 static int IDX[NKEYS];
 static int KEY_OF[NPARAMS];   /* PARAMS[] position -> key enum, -1 = not ours */
@@ -112,7 +117,7 @@ struct Plugin {
     std::atomic<int> notify[NPARAMS];
     float open[NPARAMS] = {0};
     volatile int release[NPARAMS] = {0};
-    bool pressed[NPARAMS] = {false};   /* momentary params (LOAD, SAVE): the host currently reports them pressed */
+    bool pressed[NPARAMS] = {false};   /* momentary params (LOAD, SAVE, RANDOM, UNDO): the host currently reports them pressed */
     std::atomic<bool> dirty{true};
     carp::Voice voice[NVOICES];
     carp::Reverb reverb;
@@ -129,6 +134,8 @@ struct Plugin {
     uint8_t held[32];             /* held keys, oldest first */
     int nheld = 0;
     std::vector<uint8_t> chunk;
+    uint32_t rng = 0x2600u;       /* RANDOM's own generator (xorshift32, never 0) */
+    std::string undo;             /* the sound before the last RANDOM; UNDO swaps it back and forth */
 };
 
 static int param_index(const char *key) {
@@ -136,6 +143,9 @@ static int param_index(const char *key) {
     return -1;
 }
 static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+/* momentary params: LOAD, SAVE, RANDOM, UNDO */
+static bool is_button(int i) { const int k = KEY_OF[i]; return k == PRESET_LOAD || k == PRESET_SAVE || k == RND_GO || k == RND_UNDO; }
+static bool is_rnd_setting(int i) { const int k = KEY_OF[i]; return k == RND_STYLE || k == RND_VAR || k == RND_MOD; }
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 static void copy_str(void *dst, const char *s, size_t max) {
     std::strncpy((char *)dst, s, max - 1);
@@ -426,7 +436,7 @@ static bool g_bank_loaded;
 static std::string g_slot_chunk[NSLOTS], g_slot_name[NSLOTS], g_bank_path;
 
 static void start_values(Plugin *w);
-static std::string build_state(Plugin *w);
+static std::string build_state(Plugin *w, bool project);
 static void apply_state(Plugin *w, const std::string &t, bool with_slot);
 
 /* Next to the plug-in's own folder rather than inside it, so reinstalling the folder doesn't take
@@ -506,10 +516,280 @@ static void slot_load(Plugin *w) {
     w->dirty.store(true);
 }
 static void slot_save(Plugin *w) {
-    std::string c = build_state(w);
+    std::string c = build_state(w, false);
     std::lock_guard<std::mutex> lk(g_bank_lock);
     g_slot_chunk[w->cur] = c;
     bank_write_locked();
+}
+
+/* ---- RANDOM: a new patch by style, or a variation of the current one ---------
+ * STYLE picks the kind of sound (ANY = one of the five at random on every press). VARIATION 100
+ * draws a completely new patch; below that every knob only moves that far towards the new
+ * draw and every switch / matrix slot changes with that probability, so small values give
+ * variations of what is playing. MODULATION sets how much movement the patch gets: how many
+ * matrix slots are used and how deep, and how likely the fixed FM knobs, S&H FM and REPEAT are.
+ * The matrix is drawn from a list of patches that make sense on this instrument (LFO -> cutoff,
+ * S&H -> cutoff, velocity / wheel / aftertouch -> cutoff, cross modulation, auto-pan ...), each
+ * weighted per style and only where its target is audible. Nothing goes to the VCA: the matrix adds
+ * there, so it would open the VCA without a key. A final check keeps every result
+ * playable: an LF oscillator never sits in the mixer, something always reaches the filter, the
+ * VCA opens, the filter opens. Volume, pan, voice mode and the preset slot are never touched.
+ * One step of UNDO: it swaps the sound before the last RANDOM with the current one. */
+enum { ST_ANY, ST_BASS, ST_LEAD, ST_PAD, ST_PERC, ST_FX, NSTYLE };
+
+struct Rnd {
+    uint32_t &s;
+    float u() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return (float)(s >> 8) * (1.0f / 16777216.0f); }
+    float r(float lo, float hi) { return lo + (hi - lo) * u(); }
+    float r(const float (&lh)[2]) { return r(lh[0], lh[1]); }
+    int i(int n) { const int v = (int)(u() * (float)n); return v < n ? v : n - 1; }
+    bool p(float prob) { return u() < prob; }
+};
+
+/* a matrix patch: source, destination, amount range (module.json units), random sign,
+ * weight per style: BASS, LEAD, PAD, PERC, FX */
+struct Recipe { int src, dst; float lo, hi; bool bipolar; float wt[5]; };
+static const Recipe RECIPES[] = {
+    {carp::SRC_LFO, carp::DST_CUTOFF, 20, 55, true, {2, 2, 4, 1, 3}},          /* filter sweep / wobble */
+    {carp::SRC_LFO, carp::DST_PW2, 25, 60, false, {2, 3, 4, 0, 1}},            /* PWM */
+    {carp::SRC_SH, carp::DST_CUTOFF, 30, 70, false, {2, 1, 1, 1, 4}},          /* S&H bubbles */
+    {carp::SRC_SH, carp::DST_P1, 10, 40, true, {0, 0.5f, 0, 0.5f, 3}},         /* random pitch */
+    {carp::SRC_ADSR, carp::DST_P2, 15, 45, true, {1, 1, 0, 1, 2}},             /* sync-like sweep of VCO 2 */
+    {carp::SRC_ADSR, carp::DST_P1, 30, 60, false, {0, 0, 0, 3, 1}},            /* drum pitch drop */
+    {carp::SRC_AR, carp::DST_CUTOFF, 25, 60, false, {1, 1, 2, 1, 1}},          /* second filter envelope */
+    {carp::SRC_VEL, carp::DST_CUTOFF, 25, 55, false, {3, 2, 1, 3, 1}},         /* velocity brightness */
+    {carp::SRC_WHEEL, carp::DST_CUTOFF, 30, 70, false, {2, 3, 3, 1, 2}},       /* play: wheel opens */
+    {carp::SRC_WHEEL, carp::DST_RESO, 30, 60, false, {1, 1, 1, 0, 1}},
+    {carp::SRC_AT, carp::DST_CUTOFF, 25, 55, false, {1, 2, 3, 0, 1}},          /* play: pressure opens */
+    {carp::SRC_AT, carp::DST_P1, 8, 15, false, {0, 1, 0, 0, 0.5f}},            /* pressure bends up */
+    {carp::SRC_KBD, carp::DST_PAN, 30, 60, true, {0, 1, 2, 1, 1}},             /* keys across the stereo field */
+    {carp::SRC_LFO, carp::DST_PAN, 30, 60, true, {0, 1, 3, 1, 2}},             /* auto-pan */
+    {carp::SRC_SH, carp::DST_PAN, 30, 60, true, {0, 0, 1, 2, 2}},              /* random pan */
+    {carp::SRC_LFO, carp::DST_REVERB, 30, 70, false, {0, 0, 1, 0, 1}},         /* breathing spring */
+    {carp::SRC_ADSR, carp::DST_LFO_RATE, 30, 70, true, {0, 0, 1, 0, 2}},       /* LFO speeds up / slows down */
+    {carp::SRC_LFO, carp::DST_P1, 30, 70, true, {0, 0, 0, 0, 2}},              /* siren */
+    {carp::SRC_LFO, carp::DST_P3, 5, 12, true, {0, 1, 2, 0, 0}},               /* slow drift of VCO 3 */
+    {carp::SRC_VCO2, carp::DST_CUTOFF, 15, 45, false, {1, 1, 0, 1, 3}},        /* audio FM of the filter */
+    {carp::SRC_VCO3, carp::DST_P1, 15, 45, true, {0.5f, 0.5f, 0, 2, 3}},       /* cross modulation */
+    {carp::SRC_NOISE, carp::DST_CUTOFF, 10, 30, false, {0.5f, 0, 0, 2, 1}},    /* grit */
+    {carp::SRC_SH, carp::DST_RESO, 30, 60, false, {0, 0, 0, 0, 1}},
+    {carp::SRC_SH, carp::DST_PW2, 30, 60, false, {0, 0, 1, 0, 1}},
+    {carp::SRC_AR, carp::DST_SH_RATE, 30, 60, true, {0, 0, 0, 0, 1}},          /* S&H clock follows the AR */
+};
+enum { NRECIPES = (int)(sizeof RECIPES / sizeof RECIPES[0]) };
+
+/* T[] holds the current values on entry (module.json units); the draw overwrites the sound keys */
+static void rnd_draw(Rnd &g, int st, float mod, float *T) {
+    const int s = st - 1;                                  /* 0..4: BASS LEAD PAD PERC FX */
+    static const float CUT[5][2] = {{15, 45}, {35, 70}, {30, 65}, {50, 95}, {20, 90}};
+    static const float RESO_[5][2] = {{10, 75}, {0, 50}, {0, 40}, {0, 60}, {0, 90}};
+    static const float FKBD[5][2] = {{40, 80}, {40, 90}, {30, 70}, {0, 50}, {0, 100}};
+    static const float FENV[5][2] = {{30, 75}, {15, 55}, {0, 40}, {0, 50}, {0, 80}};
+    static const float DRV[5][2] = {{30, 80}, {15, 60}, {10, 45}, {20, 70}, {0, 100}};
+    static const float ATT[5][2] = {{0, 8}, {0, 25}, {40, 75}, {0, 3}, {0, 70}};
+    static const float DEC[5][2] = {{30, 60}, {35, 65}, {50, 80}, {30, 55}, {20, 80}};
+    static const float SUS[5][2] = {{0, 60}, {50, 90}, {50, 90}, {0, 0}, {0, 100}};
+    static const float REL[5][2] = {{15, 35}, {25, 50}, {55, 80}, {30, 55}, {20, 80}};
+    static const float LFO[5][2] = {{30, 75}, {50, 72}, {10, 45}, {40, 85}, {0, 95}};
+    static const float SHR[5][2] = {{40, 80}, {40, 80}, {20, 60}, {50, 90}, {20, 95}};
+    static const float LAG[5][2] = {{0, 30}, {0, 30}, {20, 70}, {0, 15}, {0, 60}};
+    static const float REVM[5][2] = {{5, 15}, {10, 40}, {30, 65}, {5, 40}, {10, 70}};
+    static const float REVL[5][2] = {{10, 40}, {20, 60}, {50, 90}, {10, 50}, {10, 95}};
+    static const float P_REV[5] = {0.3f, 0.7f, 0.95f, 0.5f, 0.7f};
+    static const float P_NOISE[5] = {0.08f, 0.08f, 0.15f, 0.6f, 0.3f};
+    static const float P_RING[5] = {0.05f, 0.08f, 0.08f, 0.25f, 0.35f};
+    static const float P_AFM[5] = {0.25f, 0.25f, 0.12f, 0.4f, 0.6f};     /* audio-rate FM knobs, times MODULATION */
+    static const float P_MULTI[5] = {0.5f, 0.3f, 0.2f, 1.0f, 0.5f};
+    static const float P_ARVCA[5] = {0.1f, 0.15f, 0.25f, 0.05f, 0.3f};
+    static const float P_PORTA[5] = {0.3f, 0.4f, 0.05f, 0.0f, 0.2f};
+    static const float PORTA_HI[5] = {25, 40, 30, 0, 60};
+    static const float P_VIB[5] = {0.05f, 0.6f, 0.3f, 0.0f, 0.15f};
+    static const float VIB_HI[5] = {12, 30, 15, 0, 60};
+    static const float P_REPEAT[5] = {0.12f, 0.05f, 0.05f, 0.1f, 0.35f};
+    static const float DETUNE[5] = {10, 12, 20, 30, 50};
+    static const int NOSC[5][3] = {{30, 50, 20}, {30, 45, 25}, {15, 45, 40}, {50, 35, 15}, {30, 40, 30}};   /* % for 1, 2, 3 VCOs */
+    static const int IV[5][11] = {{0, 0, 0, -12, 12, 7, -12, 0, 0, 0, 0}, {0, 0, 12, -12, 7, 19, 24, 5, 0, 12, 7},
+                                  {0, 0, 12, -12, 7, 19, 5, 4, 3, 12, 7}, {0, 7, 12, 5, 1, 6, 11, 13, 0, 12, 7},
+                                  {0, 1, 6, 7, 11, 12, 13, 19, 24, -12, -7}};
+
+    /* oscillators: a base pitch, intervals that suit the style, a little detune */
+    int base = 60;
+    switch (st) {
+    case ST_BASS: base = g.p(0.7f) ? 48 : 36; break;
+    case ST_LEAD: base = g.p(0.6f) ? 60 : 72; break;
+    case ST_PAD: base = g.p(0.6f) ? 60 : 48; break;
+    case ST_PERC: base = 48 + 12 * g.i(2); break;
+    default: base = 36 + 12 * g.i(4); break;
+    }
+    const int C[3] = {V1_COARSE, V2_COARSE, V3_COARSE}, F[3] = {V1_FINE, V2_FINE, V3_FINE};
+    for (int v = 0; v < 3; v++) {
+        T[C[v]] = (float)clampi(base + (v ? IV[s][g.i(11)] : 0), 4, 123);
+        T[F[v]] = v ? (g.p(0.5f) ? 1 : -1) * g.r(2, DETUNE[s]) : g.r(-3, 3);
+    }
+    T[V1_LF] = T[V2_LF] = T[V3_LF] = 0;
+    T[V1_KBD] = T[V3_KBD] = 1;
+
+    /* which VCOs reach the mixer, and with which waves */
+    const int roll = g.i(100), nosc = roll < NOSC[s][0] ? 1 : roll < NOSC[s][0] + NOSC[s][1] ? 2 : 3;
+    int order[3] = {0, 1, 2};
+    for (int k = 2; k > 0; k--) { const int j = g.i(k + 1); std::swap(order[k], order[j]); }
+    if (order[0] != 0 && g.p(0.5f)) std::swap(order[0], order[order[1] == 0 ? 1 : 2]);   /* VCO 1 leads more often */
+    bool in[3] = {false, false, false};
+    for (int k = 0; k < nosc; k++) in[order[k]] = true;
+    for (int k : {MIX_V1SQ, MIX_V2PULSE, MIX_V3SAW, MIX_NOISE, MIX_V1SAW, MIX_V2TRI, MIX_RING, VCA_RING}) T[k] = 0;
+    if (in[0]) {
+        const float w = g.u();
+        if (w < 0.65f) T[MIX_V1SAW] = g.r(55, 90);
+        else if (w < 0.9f) T[MIX_V1SQ] = g.r(55, 90);
+        else { T[MIX_V1SAW] = g.r(40, 70); T[MIX_V1SQ] = g.r(40, 70); }
+    }
+    if (in[1]) T[g.p(0.6f) ? MIX_V2PULSE : MIX_V2TRI] = g.r(55, 90);
+    if (in[2]) T[MIX_V3SAW] = g.r(55, 90);
+    T[V2_PW] = st == ST_BASS ? g.r(25, 50) : g.r(12, 50);
+    T[V3_PW] = g.r(15, 50);
+    if (g.p(P_NOISE[s])) T[MIX_NOISE] = st == ST_PERC ? g.r(40, 100) : st == ST_FX ? g.r(10, 80) : g.r(8, 30);
+    T[NOISE_COLOR] = g.r(0, 100);
+    if (g.p(P_RING[s])) {
+        T[MIX_RING] = g.r(40, 90);
+        if ((st == ST_PERC || st == ST_FX) && g.p(0.6f)) { T[V2_COARSE] = (float)clampi(base + 5 + g.i(26), 4, 123); T[V2_FINE] = g.r(-100, 100); }   /* metallic */
+        if (st == ST_FX && g.p(0.3f)) T[VCA_RING] = g.r(20, 60);
+    }
+    if (st == ST_FX && !in[2] && g.p(0.35f)) { T[V3_LF] = 1; T[V3_COARSE] = (float)(20 + g.i(81)); }   /* VCO 3 as a third LFO */
+    if (st == ST_FX && g.p(0.1f)) T[V1_KBD] = 0;                                                       /* fixed pitch */
+
+    /* the fixed FM knobs: depth of the patch, scaled by MODULATION */
+    for (int k : {V1_FM_ADSR, V1_FM_VCO2, V1_FM_SH, V2_FM_ADSR, V2_FM_VCO1, V2_FM_SH, V2_PWM_NOISE, V3_FM_NOISE, V3_FM_ADSR, V3_FM_VCO2, F_FM_VCO2}) T[k] = 0;
+    for (int k : {V1_FM_VCO2, V2_FM_VCO1, V3_FM_VCO2, F_FM_VCO2}) if (g.p(mod * P_AFM[s])) T[k] = g.r(5, 15 + 45 * mod);
+    if (st == ST_PERC && g.p(0.75f)) {                     /* drum: all VCOs sweep down together */
+        const float a = g.r(25, 70);
+        T[V1_FM_ADSR] = a; T[V2_FM_ADSR] = a; T[V3_FM_ADSR] = a;
+    } else {
+        static const float P_PENV[5] = {0.1f, 0.1f, 0.05f, 0.2f, 0.35f};
+        for (int k : {V1_FM_ADSR, V2_FM_ADSR, V3_FM_ADSR}) if (g.p(mod * P_PENV[s])) T[k] = g.r(10, 40);
+    }
+    static const float P_SHFM[5] = {0.05f, 0.05f, 0.05f, 0.1f, 0.35f};
+    for (int k : {V1_FM_SH, V2_FM_SH}) if (g.p(mod * P_SHFM[s])) T[k] = g.r(10, 45);
+    if ((st == ST_PERC || st == ST_FX) && g.p(mod * 0.25f)) T[V3_FM_NOISE] = g.r(10, 40);
+    if (g.p(mod * (st == ST_FX ? 0.2f : 0.08f))) T[V2_PWM_NOISE] = g.r(10, 50);
+
+    /* filter, envelopes, VCA */
+    T[CUTOFF] = g.r(CUT[s]); T[RESO] = g.r(RESO_[s]); T[F_KBD] = g.r(FKBD[s]); T[F_ADSR] = g.r(FENV[s]);
+    T[DRIVE] = g.r(DRV[s]); T[F_TYPE] = g.p(0.3f) ? 1 : 0;
+    T[F_VEL] = g.p(st == ST_PERC ? 0.7f : 0.5f) ? g.r(10, 40) : 0;
+    T[ATTACK] = g.r(ATT[s]); T[DECAY] = g.r(DEC[s]); T[SUSTAIN] = g.r(SUS[s]); T[RELEASE] = g.r(REL[s]);
+    if (st == ST_PERC) T[RELEASE] = std::max(0.0f, std::min(100.0f, T[DECAY] + g.r(-5, 5)));
+    T[AR_ATTACK] = g.r(ATT[s]); T[AR_RELEASE] = g.r(REL[s]);
+    T[TRIG] = g.p(P_MULTI[s]) ? 1 : 0;
+    T[VCA_GAIN] = 0;
+    if (g.p(P_ARVCA[s])) { T[VCA_AR] = g.r(70, 100); T[VCA_ADSR] = 0; }
+    else { T[VCA_ADSR] = g.r(85, 100); T[VCA_AR] = 0; }
+    T[PORTA] = g.p(P_PORTA[s]) ? g.r(5, PORTA_HI[s]) : 0;
+
+    /* LFO, vibrato, S&H, REPEAT, spring */
+    T[LFO_RATE] = g.r(LFO[s]); T[LFO_SHAPE] = (float)g.i(3);
+    T[VIB_DEPTH] = g.p(P_VIB[s]) ? g.r(5, VIB_HI[s]) : 0; T[VIB_DELAY] = g.r(0, 50);
+    T[SH_RATE] = g.r(SHR[s]); T[SH_SOURCE] = g.p(0.7f) ? 0 : (float)(1 + g.i(2)); T[SH_LAG] = g.r(LAG[s]);
+    T[REPEAT] = 0;
+    if (g.p(mod * P_REPEAT[s])) { T[REPEAT] = 1; T[LFO_RATE] = g.r(50, 80); }   /* KEY only: no sound without a key */
+    T[REV_MIX] = g.p(P_REV[s]) ? g.r(REVM[s]) : 0; T[REV_LEN] = g.r(REVL[s]);
+
+    /* the matrix: MODULATION decides how many slots and how deep, the style which patches */
+    for (int i = 0; i < carp::NSLOTS; i++) { T[M1_SRC + 3 * i] = 0; T[M1_DST + 3 * i] = carp::DST_CUTOFF; T[M1_AMT + 3 * i] = 0; }
+    const bool aud1 = T[MIX_V1SAW] + T[MIX_V1SQ] + T[MIX_RING] > 0, aud2 = T[MIX_V2PULSE] + T[MIX_V2TRI] + T[MIX_RING] > 0 || T[V2_FM_VCO1] > 0;
+    float wt[NRECIPES];
+    for (int r = 0; r < NRECIPES; r++) {
+        const Recipe &q = RECIPES[r];
+        bool ok = true;
+        if (q.dst == carp::DST_PW2) ok = T[MIX_V2PULSE] > 0;
+        if (q.dst == carp::DST_P1) ok = aud1;
+        if (q.dst == carp::DST_P2) ok = aud2;
+        if (q.dst == carp::DST_P3) ok = T[MIX_V3SAW] > 0;
+        wt[r] = ok ? q.wt[s] * (q.src == carp::SRC_VCO3 && T[V3_LF] > 0.5f ? 3.0f : 1.0f) : 0;
+    }
+    const int n = clampi((int)std::lround(mod * 6 * g.r(0.4f, 1.0f)), 0, carp::NSLOTS);
+    const float depth = 0.7f + 0.6f * mod;
+    for (int i = 0; i < n; i++) {
+        float sum = 0;
+        for (int r = 0; r < NRECIPES; r++) sum += wt[r];
+        if (sum <= 0) break;
+        float x = g.u() * sum;
+        int r = 0;
+        while (r < NRECIPES - 1 && (x -= wt[r]) >= 0) r++;
+        if (wt[r] <= 0) break;
+        wt[r] = 0;                                         /* each patch once */
+        const Recipe &q = RECIPES[r];
+        T[M1_SRC + 3 * i] = (float)q.src;
+        T[M1_DST + 3 * i] = (float)q.dst;
+        T[M1_AMT + 3 * i] = std::min(100.0f, g.r(q.lo, q.hi) * depth) * (q.bipolar && g.p(0.5f) ? -1.0f : 1.0f);
+    }
+}
+
+/* whatever came out, it must play: called on the merged result. Values it sets sit on the 0.1 grid
+ * (floors rounded up, scaled amounts toward zero), so a second pass changes nothing. */
+static float up10(float v) { return std::ceil(v * 10 - 1e-3f) * 0.1f; }
+static void rnd_safe(float *o) {
+    if (o[V1_LF] > 0.5f) o[MIX_V1SQ] = o[MIX_V1SAW] = 0;   /* an LF oscillator modulates, it doesn't sound */
+    if (o[V2_LF] > 0.5f) o[MIX_V2PULSE] = o[MIX_V2TRI] = 0;
+    if (o[V3_LF] > 0.5f) o[MIX_V3SAW] = 0;
+    const float ring = o[V1_LF] < 0.5f && o[V2_LF] < 0.5f ? o[MIX_RING] : 0;
+    if (o[MIX_V1SQ] + o[MIX_V1SAW] + o[MIX_V2PULSE] + o[MIX_V2TRI] + o[MIX_V3SAW] + o[MIX_NOISE] + ring < 35) {
+        o[V1_LF] = 0; o[MIX_V1SAW] = std::max(o[MIX_V1SAW], 70.0f);
+    }
+    if (o[VCA_ADSR] + o[VCA_AR] < 60 && o[VCA_GAIN] < 30) o[VCA_ADSR] = 100;
+    if (o[REPEAT] > 0.5f) { o[ATTACK] = std::min(o[ATTACK], 15.0f); o[AR_ATTACK] = std::min(o[AR_ATTACK], 15.0f); }   /* the LFO gate is short */
+    float pan = 0;                                                                     /* auto-pan, never hard to one side */
+    for (int i = 0; i < carp::NSLOTS; i++) if (o[M1_DST + 3 * i] == carp::DST_PAN && o[M1_SRC + 3 * i] > 0) pan += std::fabs(o[M1_AMT + 3 * i]);
+    if (pan > 75.05f) for (int i = 0; i < carp::NSLOTS; i++) if (o[M1_DST + 3 * i] == carp::DST_PAN) o[M1_AMT + 3 * i] = std::trunc(o[M1_AMT + 3 * i] * 750 / pan) * 0.1f;
+    if (o[VCA_ADSR] >= o[VCA_AR] && o[SUSTAIN] < 20 && o[DECAY] < 28) o[DECAY] = 28;   /* not just a click */
+    if (o[VCA_AR] > o[VCA_ADSR] && o[AR_ATTACK] > 80) o[AR_ATTACK] = 80;
+    /* the filter opens: above a floor, raised by how far bipolar matrix sources (LFO, S&H, VCOs,
+     * noise) can pull the cutoff down (amount^2 x 5 octaves, one knob % = 0.1 octave) */
+    float swing = 0;
+    for (int i = 0; i < carp::NSLOTS; i++) {
+        const int src = (int)o[M1_SRC + 3 * i];
+        const bool bipolar = (src >= carp::SRC_VCO1 && src <= carp::SRC_SH) || src == carp::SRC_LFO;
+        if (o[M1_DST + 3 * i] == carp::DST_CUTOFF && bipolar) swing += sq(o[M1_AMT + 3 * i] * 0.01f) * 50;
+    }
+    const float floor_ = std::min(up10(std::max(40.0f, 55.0f - 0.9f * o[F_ADSR]) + swing), 85.0f);
+    if (o[CUTOFF] < floor_) o[CUTOFF] = floor_;
+    for (int i = 0; i < carp::NSLOTS; i++)                                                  /* the VCA only opens with a key */
+        if (o[M1_DST + 3 * i] == carp::DST_VCA && o[M1_AMT + 3 * i] != 0 && o[VCA_GAIN] <= 0) { o[M1_SRC + 3 * i] = 0; o[M1_AMT + 3 * i] = 0; }
+}
+
+static bool rnd_sound_key(int k) {   /* what RANDOM may change: the sound, not level, pan, voices, slot */
+    return k < PRESET && k != PAN && k != VOLUME && k != VOICE_MODE;
+}
+static bool rnd_discrete(int k) {
+    return k == V1_COARSE || k == V2_COARSE || k == V3_COARSE || (IDX[k] >= 0 && PARAMS[IDX[k]].nopts > 0);
+}
+static bool rnd_matrix(int k) { return k >= M1_SRC && k <= M6_AMT; }
+
+static void rnd_go(Plugin *w) {
+    Rnd g{w->rng};
+    const int sel = clampi((int)val(w, RND_STYLE), 0, NSTYLE - 1);
+    const int st = sel == ST_ANY ? 1 + g.i(NSTYLE - 1) : sel;
+    const float var = pct(w, RND_VAR), mod = pct(w, RND_MOD);
+    float cur[NKEYS], T[NKEYS], o[NKEYS];
+    for (int k = 0; k < NKEYS; k++) cur[k] = T[k] = o[k] = val(w, k);
+    rnd_draw(g, st, mod, T);
+    for (int k = 0; k < NKEYS; k++) {
+        if (!rnd_sound_key(k) || rnd_matrix(k)) continue;
+        o[k] = rnd_discrete(k) ? (g.p(var) ? T[k] : cur[k]) : cur[k] + (T[k] - cur[k]) * var;
+    }
+    for (int i = 0; i < carp::NSLOTS; i++)   /* a slot changes as a whole */
+        if (g.p(var)) for (int j = 0; j < 3; j++) o[M1_SRC + 3 * i + j] = T[M1_SRC + 3 * i + j];
+    for (int k = 0; k < NKEYS; k++)   /* new values in 0.1 steps: the state text keeps them exactly, so UNDO is exact */
+        if (o[k] != cur[k]) o[k] = std::round(o[k] * 10) * 0.1f;
+    rnd_safe(o);
+    w->undo = build_state(w, false);
+    for (int k = 0; k < NKEYS; k++) if (rnd_sound_key(k) && o[k] != cur[k]) start(w, k, o[k]);
+    w->dirty.store(true);
+}
+static void rnd_undo(Plugin *w) {
+    if (w->undo.empty()) return;
+    const std::string now = build_state(w, false);
+    apply_state(w, w->undo, false);
+    w->undo = now;
 }
 
 static void setParameter(AEffect *e, int32_t i, float n) {
@@ -522,12 +802,17 @@ static void setParameter(AEffect *e, int32_t i, float n) {
         if (v != w->cur) { w->cur = v; w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f); }
         return;
     }
-    if (KEY_OF[i] == PRESET_LOAD || KEY_OF[i] == PRESET_SAVE) {
+    if (is_button(i)) {
         const bool down = n > 0.5f;
         const bool rising = down && !w->pressed[i];   /* an echo of our own automate must not re-fire */
         w->pressed[i] = down;
         if (rising) {
-            if (KEY_OF[i] == PRESET_LOAD) slot_load(w); else slot_save(w);
+            switch (KEY_OF[i]) {
+            case PRESET_LOAD: slot_load(w); break;
+            case PRESET_SAVE: slot_save(w); break;
+            case RND_GO: rnd_go(w); break;
+            default: rnd_undo(w); break;
+            }
             w->release[i] = 1;
             w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f);
         }
@@ -550,20 +835,21 @@ static float getParameter(AEffect *e, int32_t i) {
     Plugin *w = (Plugin *)e->object;
     if (i < 0 || i >= NPARAMS) return 0.0f;
     if (KEY_OF[i] == PRESET) return (float)w->cur / (NSLOTS - 1);
-    if (KEY_OF[i] == PRESET_LOAD || KEY_OF[i] == PRESET_SAVE) return 0.0f;   /* triggers always read released */
+    if (is_button(i)) return 0.0f;   /* triggers always read released */
     if (popup_is(i)) return w->open[i];
     return w->cache[i].load();
 }
 
 /* project chunk: "CARP1;key=value;..." - by key, so parameters added in later phases keep
  * old projects loading (missing keys stay at their start values, unknown ones are skipped) */
-static bool not_stored(int i) { const int k = KEY_OF[i]; return k == PRESET || k == PRESET_LOAD || k == PRESET_SAVE || popup_is(i); }
-/* state as text: "CARP1;key=value;..." for every control - the project chunk and the preset slots */
-static std::string build_state(Plugin *w) {
+static bool not_stored(int i) { const int k = KEY_OF[i]; return k == PRESET || is_button(i) || popup_is(i); }
+/* state as text: "CARP1;key=value;..." for every control - the project chunk, the preset slots and
+ * UNDO. The RANDOM settings (style, variation, modulation) belong to the project, not to a sound. */
+static std::string build_state(Plugin *w, bool project) {
     std::string t = "CARP1;";
     char buf[96];
     for (int i = 0; i < NPARAMS; i++) {
-        if (not_stored(i)) continue;
+        if (not_stored(i) || (!project && is_rnd_setting(i))) continue;
         std::snprintf(buf, sizeof buf, "%s=%.3f;", PARAMS[i].key, (double)val_at(w, i)); t += buf;
     }
     return t;
@@ -584,12 +870,12 @@ static void apply_state(Plugin *w, const std::string &t, bool with_slot) {
             continue;
         }
         int i = param_index(key.c_str());
-        if (i >= 0 && !not_stored(i)) set_val(w, i, std::atof(kv.c_str() + eq + 1));
+        if (i >= 0 && !not_stored(i) && (with_slot || !is_rnd_setting(i))) set_val(w, i, std::atof(kv.c_str() + eq + 1));
     }
     w->dirty.store(true);
 }
 static intptr_t get_chunk(Plugin *w, void **ptr) {
-    const std::string t = build_state(w) + "prog=" + std::to_string(w->cur) + ";";
+    const std::string t = build_state(w, true) + "prog=" + std::to_string(w->cur) + ";";
     w->chunk.assign(t.begin(), t.end());
     *ptr = w->chunk.data();
     return (intptr_t)w->chunk.size();
@@ -619,7 +905,7 @@ static void display(Plugin *w, int idx, char *buf, size_t n) {
         return;
     }
     if (KEY_OF[idx] == PRESET) { std::snprintf(buf, n, "%s", slot_title(w->cur).c_str()); return; }
-    if (KEY_OF[idx] == PRESET_LOAD || KEY_OF[idx] == PRESET_SAVE) { buf[0] = 0; return; }
+    if (is_button(idx)) { buf[0] = 0; return; }
     const int u = norm_to_ui(pp, w->cache[idx].load());
     if (pp->nopts) { std::snprintf(buf, n, "%s", pp->opts[u]); return; }
     const float x = (val_at(w, idx) - pp->min) / (pp->max > pp->min ? pp->max - pp->min : 1);
@@ -739,6 +1025,10 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     w->master = master;
     for (int i = 0; i < NPARAMS; i++) { w->cache[i].store(PARAMS[i].def); w->notify[i].store(0); }
     start_values(w);
+    start(w, RND_STYLE, ST_ANY); start(w, RND_VAR, 100); start(w, RND_MOD, 50);   /* not in start_values: LOAD keeps them */
+    w->rng = (uint32_t)std::time(nullptr) * 2654435761u ^ (uint32_t)(uintptr_t)w;
+    if (const char *seed = std::getenv("CARP2000_SEED")) w->rng = (uint32_t)std::strtoul(seed, nullptr, 10);   /* offline test */
+    if (!w->rng) w->rng = 0x2600u;
     { std::lock_guard<std::mutex> lk(g_bank_lock); bank_load_locked(); }
     for (int v = 0; v < NVOICES; v++) w->voice[v].init(w->sr);
     w->reverb.init(w->sr);
