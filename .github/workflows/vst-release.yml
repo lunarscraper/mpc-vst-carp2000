@@ -6,7 +6,7 @@ on:
       version:
         description: Version, e.g. 0.1.0
         required: true
-        default: 0.1.0
+        default: 1.1.0
       dry_run:
         description: Build only (zip + skin previews as run artifacts), no draft release
         type: boolean
@@ -26,5 +26,5 @@ jobs:
       host_test: bash vst/test.sh
       plugin_id: carp2000
       license: MIT
-      about: Semi-modular synthesizer in the manner of the ARP 2600 - 3 VCOs, ring modulator, noise, ladder filter, ADSR/AR, LFO, S&H, 6-slot modulation matrix, spring reverb; mono, duophonic or 4 voices; 32 preset slots.
+      about: Semi-modular synthesizer in the manner of the ARP 2600 - 3 VCOs, ring modulator, noise, ladder filter, ADSR/AR, LFO, S&H, 6-slot modulation matrix, spring reverb; mono, duophonic or 4 voices; 32 preset slots; RANDOM patch by style with undo.
       dry_run: ${{ inputs.dry_run }}
