@@ -6,6 +6,12 @@ Semi-modularer Synthesizer nach dem Vorbild des ARP 2600 als VST2-Plugin für Ak
 
 **Status:** Alle drei Phasen des Fahrplans sind umgesetzt, dazu eine Zufallsfunktion (RANDOM), siehe [Stand](#stand).
 
+## Force-Look (Version 1.2.0)
+
+Große Schrift und große Tasten, gut lesbar auf Armlänge, auf einer farbigen Seite mit eigenem Farbschema: Sonnenuntergang (Orange/Violett) - Verlauf, Lichtstrahlen, dunkle Felder hinter den Bedienelementen für Kontrast. LOAD, SAVE, UNDO und RANDOM sind große Tasten; MIXER und die Hüllkurven (ADSR, AR) sind Fader; LF und KEYBOARD sind zwei große Felder OFF | ON, TRIGGER, REPEAT, TYPE und VOICE MODE ebenfalls Felder. Q-Links: nur Regler, Fader und Auswahlen - LF, KEYBOARD sowie LOAD/SAVE liegen nicht mehr auf den Q-Links.
+
+Technik: `vst/force_look.py` läuft als `skin_post` von `gen_vst.py` und malt die Bilder des Generators neu (gleiche Dateinamen und Größen, TUI.json und Q-Links bleiben, wie der Generator sie baut). Bedienelemente haben einen transparenten Grund und liegen auf dem Seitenbild; die Zeilen `#@look`, `#@title`, `#@frame`, `#@text` in `layout.conf` sind Kommentare für den Generator und werden von `force_look.py` gezeichnet. Parameter, Presets und Projekte sind unverändert. Der Workflow nutzt open-mpc/mpc-vst-plugins (Stand 1af05b9, mit Installation nach "VST2 Plugins" ab MPC OS 3.10.1). Nach dem Installieren die Force einmal neu starten: MPC lädt einen geänderten Skin erst nach einem Neustart.
+
 ## Idee
 
 Der 2600 ist ein vorverdrahteter Modularsynth: Ohne Kabel gibt es einen festen Signalweg, mit Kabeln lässt sich alles umstecken. Freies Patchen ist auf dem Force-Display kaum bedienbar. Dieses Plugin übernimmt deshalb
